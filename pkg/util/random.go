@@ -1,6 +1,7 @@
 package util
 
 import (
+	cryptorand "crypto/rand"
 	"math/rand"
 	"time"
 )
@@ -65,16 +66,44 @@ func GenerateRandomSingleNumber(start int, end int) int {
 	return r.Intn(end-start) + start
 }
 
-// GetRandomString generates random string of specified length
-// GetRandomString 生成指定长度的随机字符串
+// GetRandomString generates random string of specified length using a
+// cryptographically secure random source. This is appropriate for security
+// sensitive values such as auth-token nonces and one-time passwords.
+//
+// GetRandomString 使用密码学安全的随机源生成指定长度的随机字符串。
+// 适用于授权令牌 nonce、一次性口令等安全敏感场景。
+//
+// 之所以必须使用 crypto/rand 而非 math/rand：
+//   - math/rand 的全局源在 Go < 1.20 默认种子为 1，相同进程的同一调用次序会
+//     产生固定输出，导致每次重启后授权得到的 token 相同；
+//   - 即便在 Go >= 1.20 自动播种的情况下，math/rand 输出仍然是可预测的伪随机
+//     数，不应当用于签发安全令牌的随机分量。
 func GetRandomString(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	if length <= 0 {
+		return ""
+	}
 
 	b := make([]byte, length)
-	for i := range b {
-		// Use global rand directly, no need to NewSource every time
-		// 直接使用全局 rand，无需每次都 NewSource
-		b[i] = charset[rand.Intn(len(charset))]
+	if _, err := cryptorand.Read(b); err != nil {
+		// crypto/rand should never fail on supported platforms; fall back to a
+		// time-seeded math/rand to keep the function usable rather than
+		// returning an empty string in pathological cases.
+		// 在受支持的平台上 crypto/rand 几乎不会失败；万一失败时退回到时间播种
+		// 的 math/rand，保持可用性而非返回空串。
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		for i := range b {
+			b[i] = charset[r.Intn(len(charset))]
+		}
+		return string(b)
+	}
+
+	// Map random bytes to charset. Use modulo on the underlying byte; the
+	// modest bias for a 62-character charset is acceptable for nonces.
+	// 把随机字节映射到 charset。对 62 字符的 charset 取模带来的偏置很小，
+	// 用作 nonce 完全可接受。
+	for i, x := range b {
+		b[i] = charset[int(x)%len(charset)]
 	}
 	return string(b)
 }
