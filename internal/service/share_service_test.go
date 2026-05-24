@@ -42,6 +42,35 @@ func TestBuildSharePathCandidates(t *testing.T) {
 	assert.Equal(t, expected, candidates, "resolved path candidates should match")
 }
 
+// TestBuildSharePathCandidatesPercentEncoded ensures percent-encoded markdown
+// image targets (vault-absolute paths produced by Obsidian for ![alt](url))
+// are decoded so DB lookups against literal Obsidian paths succeed.
+// TestBuildSharePathCandidatesPercentEncoded 验证百分号编码的 Markdown 图片
+// 路径（Obsidian 在 ![alt](url) 中产生的库内绝对路径）会被解码，从而能匹配
+// 数据库里的字面路径。
+func TestBuildSharePathCandidatesPercentEncoded(t *testing.T) {
+	t.Run("vault-absolute with percent-encoded space", func(t *testing.T) {
+		candidates := buildSharePathCandidates(
+			"图片显示测试/test note.md",
+			"图片显示测试/assets/test/32824b540923dd543957abdcd109b3de9d8248eb%201.jpg",
+		)
+		expected := []string{
+			"图片显示测试/图片显示测试/assets/test/32824b540923dd543957abdcd109b3de9d8248eb 1.jpg",
+			"图片显示测试/assets/test/32824b540923dd543957abdcd109b3de9d8248eb 1.jpg",
+		}
+		assert.Equal(t, expected, candidates)
+	})
+
+	t.Run("relative with percent-encoded space", func(t *testing.T) {
+		candidates := buildSharePathCandidates(
+			"notes/today.md",
+			"../images/demo%20pic.png",
+		)
+		expected := []string{"images/demo pic.png"}
+		assert.Equal(t, expected, candidates)
+	})
+}
+
 // TestRewriteMarkdownImageLinks verifies that markdown image links are rewritten to share URLs.
 // TestRewriteMarkdownImageLinks 验证 markdown 图片链接被重写为分享 URL。
 func TestRewriteMarkdownImageLinks(t *testing.T) {
