@@ -728,6 +728,18 @@ func (s *shareService) GetSharedNote(ctx context.Context, shareToken string, not
 		}
 	}
 
+	// Normalize ambiguous markdown image embeds whose URL portion contains
+	// literal whitespace (e.g. `![](en space/img2.jpg)`). The angle-bracket
+	// form added here is valid CommonMark and is handled correctly by every
+	// downstream pass (the wiki/markdown/HTML rewriters below as well as the
+	// frontend renderer).
+	// 将含有字面空白的歧义 Markdown 图片嵌入规范化为尖括号形式（CommonMark 语法），
+	// 让后续处理（包括 wiki / Markdown / HTML 重写器以及前端渲染器）都能正确解析。
+	noteDTO.Content = normalizeAmbiguousMarkdownImages(noteDTO.Content, func(ref string) bool {
+		_, ok := fileRefs[ref]
+		return ok
+	})
+
 	// Handle Obsidian attachment embedded tags ![[...]]
 	// 处理 Obsidian 附件嵌入标签 ![[...]]
 	newContent := attachmentRegex.ReplaceAllStringFunc(noteDTO.Content, func(match string) string {
@@ -842,50 +854,49 @@ func extractSharedNoteFileRefs(content string) []string {
 	seen := make(map[string]struct{})
 	refs := make([]string, 0)
 
-	for _, match := range attachmentRegex.FindAllStringSubmatch(content, -1) {
-		if len(match) < 2 {
-			continue
-		}
-		ref := extractObsidianEmbedPath(match[1])
+	addRef := func(ref string) {
+		ref = strings.TrimSpace(ref)
 		if ref == "" || !isLocalSharePath(ref) {
-			continue
+			return
 		}
 		if _, ok := seen[ref]; ok {
-			continue
+			return
 		}
 		seen[ref] = struct{}{}
 		refs = append(refs, ref)
 	}
 
+	for _, match := range attachmentRegex.FindAllStringSubmatch(content, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		addRef(extractObsidianEmbedPath(match[1]))
+	}
+
+	// For markdown image syntax we extract BOTH the strict-parse target
+	// (whitespace-split, CommonMark behavior) and the lenient-parse target
+	// (whole body minus an optional quoted title). The lenient form lets us
+	// resolve embeds like `![](en space/img2.jpg)` that editors such as
+	// Typora accept but CommonMark rejects.
+	// Markdown 图片语法同时提取严格解析目标（按空白拆分，CommonMark 行为）
+	// 与宽松解析目标（除去可选引号标题的整段内容）。宽松形式可以解析
+	// `![](en space/img2.jpg)` 这类 Typora 等编辑器支持但 CommonMark
+	// 不支持的嵌入。
 	for _, match := range markdownImageRegex.FindAllStringSubmatch(content, -1) {
 		if len(match) < 3 {
 			continue
 		}
-		ref, _, _ := parseMarkdownLinkTarget(match[2])
-		ref = strings.TrimSpace(ref)
-		if ref == "" || !isLocalSharePath(ref) {
-			continue
-		}
-		if _, ok := seen[ref]; ok {
-			continue
-		}
-		seen[ref] = struct{}{}
-		refs = append(refs, ref)
+		strictRef, _, _ := parseMarkdownLinkTarget(match[2])
+		addRef(strictRef)
+		lenientRef, _ := parseMarkdownLinkTargetLenient(match[2])
+		addRef(lenientRef)
 	}
 
 	for _, match := range htmlImageRegex.FindAllStringSubmatch(content, -1) {
 		if len(match) < 4 {
 			continue
 		}
-		ref := strings.TrimSpace(match[3])
-		if ref == "" || !isLocalSharePath(ref) {
-			continue
-		}
-		if _, ok := seen[ref]; ok {
-			continue
-		}
-		seen[ref] = struct{}{}
-		refs = append(refs, ref)
+		addRef(match[3])
 	}
 
 	return refs
@@ -940,6 +951,129 @@ targetStart:
 	return raw[start:end], start, end
 }
 
+// parseMarkdownLinkTargetLenient parses the body of `![alt](body)` allowing
+// literal whitespace inside the URL. It returns the URL portion and the raw
+// title portion (including the surrounding quote characters), if any.
+//
+// Unlike parseMarkdownLinkTarget which splits at the first whitespace and
+// treats anything after as a title (CommonMark semantics), this function
+// keeps spaces in the URL when no quoted title is present, matching how
+// editors like Typora treat `![](file with spaces.jpg)`. It is intended to
+// be a fallback used only when strict parsing produces a target that does
+// not resolve to any known file.
+//
+// parseMarkdownLinkTargetLenient 是 parseMarkdownLinkTarget 的宽松版本，
+// 允许 URL 部分包含字面空白（例如 `![](file with spaces.jpg)`），仅在严格
+// 解析无法命中文件时作为后备使用。返回 (target, title)，title 包含两端
+// 引号字符。
+func parseMarkdownLinkTargetLenient(raw string) (target string, title string) {
+	// Skip leading whitespace.
+	i := 0
+	for i < len(raw) {
+		switch raw[i] {
+		case ' ', '\t', '\n':
+			i++
+		default:
+			goto rest
+		}
+	}
+	return "", ""
+
+rest:
+	body := strings.TrimRightFunc(raw[i:], func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\n'
+	})
+	if body == "" {
+		return "", ""
+	}
+
+	// Angle-bracket form takes precedence (CommonMark): <url>.
+	if body[0] == '<' {
+		if j := strings.IndexByte(body, '>'); j > 0 {
+			return body[1:j], strings.TrimSpace(body[j+1:])
+		}
+		return "", ""
+	}
+
+	// Optional trailing quoted title: " ... " or ' ... '.
+	if n := len(body); n > 0 {
+		q := body[n-1]
+		if q == '"' || q == '\'' {
+			for k := n - 2; k > 0; k-- {
+				if body[k] == q && (body[k-1] == ' ' || body[k-1] == '\t') {
+					return strings.TrimSpace(body[:k]), body[k:]
+				}
+			}
+		}
+	}
+
+	return body, ""
+}
+
+// normalizeAmbiguousMarkdownImages rewrites markdown image embeds whose URL
+// portion contains literal whitespace into the angle-bracket form, e.g.
+// `![](en space/img2.jpg)` becomes `![](<en space/img2.jpg>)`. The rewrite
+// is only applied when:
+//   - the URL is not already wrapped in `<...>`,
+//   - the strict-parse target does NOT resolve via the provided callback
+//     (so we do not normalize embeds that already work), and
+//   - the lenient-parse target DOES resolve.
+//
+// The angle-bracket form is part of CommonMark and is handled correctly by
+// the bundled frontend's markdown image rewriter, by Obsidian, and by other
+// CommonMark-compliant renderers. Note that if the response carrying the
+// rewrite is fed back through an editor that saves what it received, the
+// `<...>` form will be persisted.
+//
+// normalizeAmbiguousMarkdownImages 将 URL 部分包含字面空白的 Markdown 图片
+// 嵌入重写为尖括号形式（CommonMark 语法）。仅在严格解析目标无法命中文件、
+// 而宽松解析目标能命中文件、并且当前形式尚未使用尖括号时执行重写，这样既
+// 能让此前显示为纯文本的图片正确渲染，又不会改动本就正常的引用。
+func normalizeAmbiguousMarkdownImages(content string, resolves func(string) bool) string {
+	if resolves == nil {
+		return content
+	}
+	return markdownImageRegex.ReplaceAllStringFunc(content, func(match string) string {
+		sm := markdownImageRegex.FindStringSubmatch(match)
+		if len(sm) < 3 {
+			return match
+		}
+		alt, body := sm[1], sm[2]
+
+		// Skip empty bodies and bodies already wrapped in <...>.
+		ws := 0
+		for ws < len(body) && (body[ws] == ' ' || body[ws] == '\t' || body[ws] == '\n') {
+			ws++
+		}
+		if ws >= len(body) || body[ws] == '<' {
+			return match
+		}
+
+		// If the strict-parse target already resolves, keep the original.
+		strict, _, _ := parseMarkdownLinkTarget(body)
+		strict = strings.TrimSpace(strict)
+		if strict != "" && resolves(strict) {
+			return match
+		}
+
+		// Otherwise try the lenient parse.
+		lenient, title := parseMarkdownLinkTargetLenient(body)
+		lenient = strings.TrimSpace(lenient)
+		if lenient == "" || lenient == strict {
+			return match
+		}
+		if !resolves(lenient) {
+			return match
+		}
+
+		newBody := "<" + lenient + ">"
+		if title != "" {
+			newBody = newBody + " " + title
+		}
+		return "![" + alt + "](" + newBody + ")"
+	})
+}
+
 func rewriteMarkdownImageLinks(content string, fileRefs map[string]*domain.File, shareToken string, password string) string {
 	return markdownImageRegex.ReplaceAllStringFunc(content, func(match string) string {
 		submatches := markdownImageRegex.FindStringSubmatch(match)
@@ -957,14 +1091,50 @@ func rewriteMarkdownImageLinks(content string, fileRefs map[string]*domain.File,
 			return match
 		}
 
-		replacementTarget := buildSharedFileAPIURL(file.ID, shareToken, password)
+		apiURL := buildSharedFileAPIURL(file.ID, shareToken, password)
+		alt := submatches[1]
+
+		// Dispatch by file extension so that videos and audios written with
+		// markdown image syntax (e.g. `![alt](clip.mp4)`) play correctly in
+		// the share view, mirroring the behavior already implemented for
+		// Obsidian's wiki-style embeds.
+		// 按文件扩展名分发，使 Markdown 图片语法的视频与音频
+		// （如 `![alt](clip.mp4)`）在分享视图中能正确播放，与 Obsidian 的
+		// wiki 风格嵌入保持一致。
+		switch detectMediaKindByExt(file.Path) {
+		case "video":
+			return `<video src="` + apiURL + `" controls style="max-width:100%"></video>`
+		case "audio":
+			return `<audio src="` + apiURL + `" controls></audio>`
+		}
+
+		// Image (default) — preserve the original markdown image form, only
+		// substituting the URL.
+		replacementTarget := apiURL
 		rawTarget := submatches[2][start:end]
 		if strings.HasPrefix(rawTarget, "<") && strings.HasSuffix(rawTarget, ">") {
 			replacementTarget = "<" + replacementTarget + ">"
 		}
 
-		return "![" + submatches[1] + "](" + submatches[2][:start] + replacementTarget + submatches[2][end:] + ")"
+		return "![" + alt + "](" + submatches[2][:start] + replacementTarget + submatches[2][end:] + ")"
 	})
+}
+
+// detectMediaKindByExt returns "image", "video", "audio", or "" based on the
+// extension of p. Extensions are matched case-insensitively.
+// detectMediaKindByExt 根据 p 的扩展名返回 "image"、"video"、"audio" 或 ""，
+// 大小写不敏感。
+func detectMediaKindByExt(p string) string {
+	ext := strings.ToLower(filepath.Ext(p))
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp":
+		return "image"
+	case ".mp4", ".webm", ".mov", ".mkv", ".avi", ".ogv":
+		return "video"
+	case ".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg":
+		return "audio"
+	}
+	return ""
 }
 
 func rewriteHTMLImageSources(content string, fileRefs map[string]*domain.File, shareToken string, password string) string {

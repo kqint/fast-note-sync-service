@@ -88,11 +88,19 @@ func (h *NoteHandler) Get(c *gin.Context) {
 		h.App.Logger().Error("NoteHandler.Get FileResolveEmbedLinks err", zap.Error(err))
 	}
 
+	// Normalize ambiguous markdown image embeds (literal whitespace in URL)
+	// to the angle-bracket CommonMark form so they render correctly in the
+	// preview. Only refs that resolve through fileLinks are rewritten; the
+	// original content is otherwise untouched.
+	// 将含有字面空白的歧义 Markdown 图片嵌入规范化为尖括号形式，使预览能
+	// 正确渲染；只重写已能解析到文件的引用，其它内容保持原样。
+	renderedContent := h.App.FileService.NormalizeAmbiguousMarkdownImages(note.Content, fileLinks)
+
 	noteWithLinks := &dto.NoteWithFileLinksResponse{
 		ID:               note.ID,
 		Path:             note.Path,
 		PathHash:         note.PathHash,
-		Content:          note.Content,
+		Content:          renderedContent,
 		ContentHash:      note.ContentHash,
 		FileLinks:        fileLinks,
 		Version:          note.Version,
