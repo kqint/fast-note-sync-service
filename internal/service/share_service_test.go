@@ -47,13 +47,52 @@ func TestBuildSharePathCandidates(t *testing.T) {
 func TestRewriteMarkdownImageLinks(t *testing.T) {
 	content := `![demo](./images/demo.png "title")`
 	fileRefs := map[string]*domain.File{
-		"./images/demo.png": {ID: 42},
+		"./images/demo.png": {ID: 42, Path: "images/demo.png"},
 	}
 
 	rewritten := rewriteMarkdownImageLinks(content, fileRefs, "share-token", "pwd")
 	expected := `![demo](/api/share/file?id=42&share_token=share-token&password=pwd "title")`
 
 	assert.Equal(t, expected, rewritten, "image links should be rewritten to share API URLs")
+}
+
+// TestRewriteMarkdownImageLinks_VideoDispatch verifies that markdown image
+// syntax pointing at a video file is rewritten to a <video> HTML element
+// instead of staying as a (broken) ![alt](url) image.
+//
+// TestRewriteMarkdownImageLinks_VideoDispatch 验证指向视频文件的 Markdown
+// 图片语法会被重写为 <video> HTML 标签，而不是保持为（坏掉的）![alt](url)。
+func TestRewriteMarkdownImageLinks_VideoDispatch(t *testing.T) {
+	content := `![demo clip](videos/demo.mp4)`
+	fileRefs := map[string]*domain.File{
+		"videos/demo.mp4": {ID: 99, Path: "videos/demo.mp4"},
+	}
+
+	rewritten := rewriteMarkdownImageLinks(content, fileRefs, "tk", "")
+
+	assert.Contains(t, rewritten, "<video")
+	assert.Contains(t, rewritten, "controls")
+	assert.Contains(t, rewritten, "/api/share/file?id=99&share_token=tk")
+	assert.NotContains(t, rewritten, "![demo clip]")
+}
+
+// TestRewriteMarkdownImageLinks_AudioDispatch verifies that markdown image
+// syntax pointing at an audio file is rewritten to an <audio> HTML element.
+//
+// TestRewriteMarkdownImageLinks_AudioDispatch 验证指向音频文件的 Markdown
+// 图片语法会被重写为 <audio> HTML 标签。
+func TestRewriteMarkdownImageLinks_AudioDispatch(t *testing.T) {
+	content := `![bgm](audio/song.mp3)`
+	fileRefs := map[string]*domain.File{
+		"audio/song.mp3": {ID: 100, Path: "audio/song.mp3"},
+	}
+
+	rewritten := rewriteMarkdownImageLinks(content, fileRefs, "tk", "pw")
+
+	assert.Contains(t, rewritten, "<audio")
+	assert.Contains(t, rewritten, "controls")
+	assert.Contains(t, rewritten, "/api/share/file?id=100&share_token=tk&password=pw")
+	assert.NotContains(t, rewritten, "![bgm]")
 }
 
 
