@@ -109,6 +109,11 @@ func (m *MockFileService) ResolveEmbedLinks(ctx context.Context, uid int64, vaul
 	return nil, args.Error(1)
 }
 
+func (m *MockFileService) NormalizeAmbiguousMarkdownImages(content string, fileLinks map[string]string) string {
+	args := m.Called(content, fileLinks)
+	return args.String(0)
+}
+
 func (m *MockFileService) GetContent(ctx context.Context, uid int64, params *dto.FileGetRequest) (io.ReadCloser, string, int64, string, error) {
 	args := m.Called(ctx, uid, params)
 	var rc io.ReadCloser

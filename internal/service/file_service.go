@@ -77,6 +77,15 @@ type FileService interface {
 	// ResolveEmbedLinks 解析笔记内容中的本地文件链接
 	ResolveEmbedLinks(ctx context.Context, uid int64, vaultName string, notePath string, content string) (map[string]string, error)
 
+	// NormalizeAmbiguousMarkdownImages rewrites ambiguous markdown image
+	// embeds (URL portion with literal whitespace) into the angle-bracket
+	// CommonMark form so they render correctly. Only refs known to resolve
+	// in fileLinks are rewritten; everything else is passed through.
+	// NormalizeAmbiguousMarkdownImages 将含有字面空白的歧义 Markdown 图片
+	// 嵌入规范化为 CommonMark 尖括号形式；只重写在 fileLinks 中存在的引用，
+	// 其余原样保留。
+	NormalizeAmbiguousMarkdownImages(content string, fileLinks map[string]string) string
+
 	// GetContent retrieves raw content of note or attachment file
 	// GetContent 获取笔记或附件文件的原始内容
 	GetContent(ctx context.Context, uid int64, params *dto.FileGetRequest) (io.ReadCloser, string, int64, string, error)
@@ -713,6 +722,17 @@ func (s *fileService) ResolveEmbedLinks(ctx context.Context, uid int64, vaultNam
 	}
 
 	return resultMap, nil
+}
+
+// NormalizeAmbiguousMarkdownImages implements the FileService interface.
+// See package-level normalizeAmbiguousMarkdownImages for the algorithm.
+// NormalizeAmbiguousMarkdownImages 实现 FileService 接口；具体算法参见
+// 包级 normalizeAmbiguousMarkdownImages。
+func (s *fileService) NormalizeAmbiguousMarkdownImages(content string, fileLinks map[string]string) string {
+	return normalizeAmbiguousMarkdownImages(content, func(ref string) bool {
+		_, ok := fileLinks[ref]
+		return ok
+	})
 }
 
 func (s *fileService) resolveNoteFileReference(ctx context.Context, uid int64, vaultID int64, notePath string, rawRef string) (*domain.File, error) {

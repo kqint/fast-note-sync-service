@@ -70,6 +70,8 @@ func TestNoteHandler_Get_Success(t *testing.T) {
 
 	mockFileSvc.On("ResolveEmbedLinks", mock.Anything, int64(1), "main", "test.md", "content").
 		Return(map[string]string{}, nil)
+	mockFileSvc.On("NormalizeAmbiguousMarkdownImages", "content", map[string]string{}).
+		Return("content")
 
 	handler := newTestNoteHandler(mockNoteSvc, mockFileSvc)
 	c, w := newNoteTestContext("GET", "/api/note", "", 1)
