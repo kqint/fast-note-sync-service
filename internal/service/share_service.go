@@ -782,6 +782,13 @@ func (s *shareService) GetSharedNote(ctx context.Context, shareToken string, not
 
 		file := fileRefs[rawPath]
 		if file == nil {
+			// Emit a missing-attachment placeholder for unresolved local embeds
+			// so the share viewer shows a clear error instead of raw markdown.
+			// 为未解析的本地嵌入发出找不到附件占位符，让分享视图显示清晰
+			// 错误而不是原始 markdown 文本。
+			if isLocalSharePath(rawPath) {
+				return buildMissingAttachmentHTML(rawPath)
+			}
 			return match
 		}
 
@@ -1029,6 +1036,31 @@ func detectMediaKindByExt(p string) string {
 	return ""
 }
 
+// buildMissingAttachmentHTML generates a styled inline HTML placeholder for an
+// attachment that could not be resolved through fileRefs. The label varies by
+// detected media type so users can quickly identify what kind of file is
+// missing instead of seeing a broken <img> or empty space.
+//
+// buildMissingAttachmentHTML 为未能解析的附件生成带样式的内联 HTML 占位符。
+// 标签根据检测到的媒体类型变化，让用户能直观识别缺少的是哪种文件，而不是
+// 看到裂开的 <img> 或空白。
+func buildMissingAttachmentHTML(rawPath string) string {
+	var label string
+	switch detectMediaKindByExt(rawPath) {
+	case "image":
+		label = "[图片找不到]"
+	case "video":
+		label = "[视频找不到]"
+	case "audio":
+		label = "[音频找不到]"
+	default:
+		label = "[附件找不到]"
+	}
+	// Minimal inline style so it renders acceptably without external CSS.
+	// 使用极简内联样式，无需外部 CSS 即可合理渲染。
+	return `<span style="display:inline-block;padding:4px 10px;margin:4px 0;border:1px dashed #e5534b;border-radius:6px;background:#fff1f0;color:#cf222e;font-size:13px" title="` + rawPath + `">` + label + " " + rawPath + `</span>`
+}
+
 func rewriteMarkdownImageLinks(content string, fileRefs map[string]*domain.File, shareToken string, password string) string {
 	return markdownImageRegex.ReplaceAllStringFunc(content, func(match string) string {
 		submatches := markdownImageRegex.FindStringSubmatch(match)
@@ -1043,6 +1075,15 @@ func rewriteMarkdownImageLinks(content string, fileRefs map[string]*domain.File,
 
 		file := fileRefs[strings.TrimSpace(target)]
 		if file == nil {
+			// If the target looks like a local vault path (not a remote URL),
+			// emit a styled missing-attachment placeholder so the share viewer
+			// sees a clear error instead of a broken <img>.
+			// 如果目标看起来是本地 vault 路径（非远程 URL），发出找不到附件
+			// 占位符，让分享视图看到清晰错误而不是坏掉的 <img>。
+			trimmed := strings.TrimSpace(target)
+			if isLocalSharePath(trimmed) {
+				return buildMissingAttachmentHTML(trimmed)
+			}
 			return match
 		}
 
