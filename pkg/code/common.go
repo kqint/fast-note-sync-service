@@ -136,4 +136,10 @@ var (
 
 	// --- Sync Conflict Related (530-539) ---
 	ErrorSyncConflict = NewError(530)
+
+	// --- Backup Import Related (540-549) ---
+	ErrorBackupImportFileEmpty  = NewError(540)
+	ErrorBackupImportZipFailed  = NewError(541)
+	ErrorBackupImportOptionInvalid = NewError(542)
+	ErrorBackupImportUnsupported   = NewError(543)
 )

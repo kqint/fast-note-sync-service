@@ -130,4 +130,10 @@ var en_messages = map[int]string{
 	520: "Cloudflared download failed",
 	521: "Cloudflared binary not found, please download the tunnel program first",
 	530: "Sync conflict detected, a conflict copy has been created",
+
+	// Backup Import
+	540: "Import file is required",
+	541: "Failed to extract backup archive (check the file and password)",
+	542: "Invalid import options: select at least one section, note history also requires notes & attachments",
+	543: "Unsupported backup archive version, please upgrade the service",
 }

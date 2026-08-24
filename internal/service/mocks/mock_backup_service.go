@@ -64,6 +64,14 @@ func (m *MockBackupService) NotifyUpdated(uid int64) {
 	m.Called(uid)
 }
 
+func (m *MockBackupService) ImportBackup(ctx context.Context, uid int64, req *dto.BackupImportRequest, zipPath string) (*dto.BackupImportResultDTO, error) {
+	args := m.Called(ctx, uid, req, zipPath)
+	if v := args.Get(0); v != nil {
+		return v.(*dto.BackupImportResultDTO), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
 func (m *MockBackupService) Shutdown(ctx context.Context) error {
 	args := m.Called(ctx)
 	return args.Error(0)

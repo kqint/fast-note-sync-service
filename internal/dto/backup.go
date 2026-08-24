@@ -32,6 +32,27 @@ type BackupHistoryListRequest struct {
 	PageSize int   `json:"pageSize" form:"pageSize" example:"10"`                   // Page size // 每页大小
 }
 
+// BackupImportRequest 备份包导入请求 (multipart/form-data)
+// BackupImportRequest backup archive import request (multipart/form-data)
+type BackupImportRequest struct {
+	Vault              string `json:"vault" form:"vault" binding:"required" example:"test"`  // Target vault name // 目标仓库名称
+	Password           string `json:"password" form:"password" example:"123456"`             // Archive password (optional) // 压缩包密码 (可选)
+	IncludeNotes       bool   `json:"includeNotes" form:"includeNotes" example:"true"`       // Import notes & attachments // 导入笔记和附件
+	IncludeVaultConfig bool   `json:"includeVaultConfig" form:"includeVaultConfig" example:"false"` // Import vault config (.obsidian) // 导入仓库配置 (.obsidian)
+	IncludeNoteHistory bool   `json:"includeNoteHistory" form:"includeNoteHistory" example:"false"` // Import note history (requires IncludeNotes) // 导入笔记历史 (需勾选笔记和附件)
+}
+
+// BackupImportResultDTO 备份包导入结果
+// BackupImportResultDTO backup import result
+type BackupImportResultDTO struct {
+	Notes          int64 `json:"notes"`                    // Imported/updated notes count // 导入(覆盖)的笔记数
+	Files          int64 `json:"files"`                    // Imported/updated attachments count // 导入(覆盖)的附件数
+	Settings       int64 `json:"settings"`                 // Imported/updated vault config count // 导入(覆盖)的仓库配置数
+	NoteHistory    int64 `json:"noteHistory"`              // Imported note history entries count // 导入的笔记历史条数
+	SkippedHistory int64 `json:"skippedHistory,omitempty"` // History entries skipped (note missing) // 跳过的历史条数 (对应笔记不存在)
+	Vault          string `json:"vault"`                   // Target vault name // 目标仓库名称
+}
+
 // BackupConfigDTO backup configuration DTO
 // BackupConfigDTO 备份配置 DTO
 type BackupConfigDTO struct {

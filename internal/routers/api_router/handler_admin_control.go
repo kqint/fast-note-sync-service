@@ -1499,3 +1499,146 @@ func (h *AdminControlHandler) CloudflaredTunnelDownload(c *gin.Context) {
 
 	response.ToResponse(code.Success.WithData(gin.H{"path": path}).WithDetails("Cloudflared binary is ready"))
 }
+
+// requireAdmin enforces the admin permission check shared by config export/import.
+// On failure it writes the error response and returns false.
+// requireAdmin 配置导入导出共用的管理员权限校验。失败时直接写出错误响应并返回 false。
+func (h *AdminControlHandler) requireAdmin(c *gin.Context) bool {
+	response := pkgapp.NewResponse(c)
+	cfg := h.App.Config()
+	uid := pkgapp.GetUID(c)
+
+	if uid == 0 {
+		response.ToResponse(code.ErrorInvalidUserAuthToken)
+		return false
+	}
+	if cfg.User.AdminUID != 0 && uid != int64(cfg.User.AdminUID) {
+		response.ToResponse(code.ErrorUserIsNotAdmin)
+		return false
+	}
+	return true
+}
+
+// ExportConfigFile downloads the raw server configuration file (config/config.yaml)
+// @Summary Export server config file
+// @Description Download the current server configuration file as config.yaml, requires admin privileges
+// @Tags Config
+// @Security UserAuthToken
+// @Produce octet-stream
+// @Success 200 {file} binary "config.yaml"
+// @Failure 403 {object} pkgapp.Res "Insufficient privileges"
+// @Failure 500 {object} pkgapp.Res "Internal Server Error"
+// @Router /api/admin/config/export [get]
+func (h *AdminControlHandler) ExportConfigFile(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
+
+	configPath := h.App.Config().File
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		h.App.Logger().Error("AdminControlHandler.ExportConfigFile.ReadFile failed", zap.Error(err))
+		pkgapp.NewResponse(c).ToResponse(code.ErrorFileReadFailed.WithDetails(err.Error()))
+		return
+	}
+
+	h.App.Logger().Info("Server config file exported via WebGUI",
+		zap.String("path", configPath),
+		zap.Int("size", len(data)))
+
+	c.Header("Content-Disposition", `attachment; filename="config.yaml"`)
+	c.Header("Content-Type", "application/x-yaml")
+	c.Data(http.StatusOK, "application/x-yaml", data)
+}
+
+// ImportConfigFile replaces the server configuration file with an uploaded YAML
+// @Summary Import server config file
+// @Description Validate an uploaded config.yaml and overwrite the server configuration file. Takes effect after service restart, requires admin privileges
+// @Tags Config
+// @Security UserAuthToken
+// @Accept multipart/form-data
+// @Produce json
+// @Param file formData file true "Config file (YAML)"
+// @Success 200 {object} pkgapp.Res "Success"
+// @Failure 400 {object} pkgapp.Res "Invalid Params"
+// @Failure 403 {object} pkgapp.Res "Insufficient privileges"
+// @Failure 500 {object} pkgapp.Res "Internal Server Error"
+// @Router /api/admin/config/import [post]
+func (h *AdminControlHandler) ImportConfigFile(c *gin.Context) {
+	response := pkgapp.NewResponse(c)
+
+	if !h.requireAdmin(c) {
+		return
+	}
+
+	fileHeader, err := c.FormFile("file")
+	if err != nil {
+		response.ToResponse(code.ErrorInvalidParams.WithDetails("config file is required: "+err.Error()))
+		return
+	}
+	// Guard against unreasonable uploads; a valid config is far smaller than this
+	// 防御异常上传；合法配置文件远小于该上限
+	const maxConfigSize = 2 << 20 // 2MB
+	if fileHeader.Size > maxConfigSize {
+		response.ToResponse(code.ErrorInvalidParams.WithDetails(fmt.Sprintf("config file too large (%d bytes), max %d bytes", fileHeader.Size, maxConfigSize)))
+		return
+	}
+
+	src, err := fileHeader.Open()
+	if err != nil {
+		response.ToResponse(code.ErrorInvalidParams.WithDetails(err.Error()))
+		return
+	}
+	defer src.Close()
+
+	configPath := h.App.Config().File
+
+	// Stage the upload next to the real config so validation and the final
+	// rename happen on the same volume (atomic on both Windows and POSIX).
+	// 将上传文件暂存到真实配置同目录，校验与最终重命名在同一卷上完成（Windows 与 POSIX 均为原子操作）。
+	tmp, err := os.CreateTemp(filepath.Dir(configPath), ".config-import-*.yaml")
+	if err != nil {
+		response.ToResponse(code.ErrorServerInternal.WithDetails(err.Error()))
+		return
+	}
+	tmpPath := tmp.Name()
+
+	if _, err := io.Copy(tmp, src); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		response.ToResponse(code.ErrorServerInternal.WithDetails(err.Error()))
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		response.ToResponse(code.ErrorServerInternal.WithDetails(err.Error()))
+		return
+	}
+
+	// Full validation through the real load path (defaults + oauth/oidc checks);
+	// rejects malformed or semantically invalid configs without touching the live one.
+	// 通过真实加载路径做完整校验（默认值填充与 oauth/oidc 校验），
+	// 拒绝格式或语义非法的配置且不影响现有配置文件。
+	if _, _, err := app.LoadConfig(tmpPath); err != nil {
+		os.Remove(tmpPath)
+		h.App.Logger().Warn("Config import validation failed",
+			zap.String("file", fileHeader.Filename),
+			zap.Error(err))
+		response.ToResponse(code.ErrorInvalidParams.WithDetails(err.Error()))
+		return
+	}
+
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		os.Remove(tmpPath)
+		h.App.Logger().Error("AdminControlHandler.ImportConfigFile.Rename failed", zap.Error(err))
+		response.ToResponse(code.ErrorConfigSaveFailed.WithDetails(err.Error()))
+		return
+	}
+
+	h.App.Logger().Info("Server config file imported via WebGUI",
+		zap.String("from", fileHeader.Filename),
+		zap.String("to", configPath),
+		zap.Int64("size", fileHeader.Size))
+
+	response.ToResponse(code.SuccessUpdate.WithDetails("Config imported successfully. Restart the service to apply changes."))
+}

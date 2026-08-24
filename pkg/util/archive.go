@@ -1,9 +1,11 @@
 package util
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/yeka/zip"
 )
@@ -96,6 +98,66 @@ func ZipWithPassword(source, target, password string) error {
 		_, err = io.Copy(writer, file)
 		return err
 	})
+}
+
+// UnzipWithPassword extracts a zip archive into the target directory,
+// optionally decrypting password-protected entries (ZipCrypto and AES).
+// Paths inside the archive are cleaned to prevent Zip Slip attacks.
+// UnzipWithPassword 将 zip 压缩包解压到目标目录，支持加密条目（ZipCrypto 与 AES）。
+// 压缩包内的路径会被清理以防止 Zip Slip 攻击。
+func UnzipWithPassword(source, targetDir, password string) error {
+	reader, err := zip.OpenReader(source)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	for _, f := range reader.File {
+		// Clean the archive path and confine it within targetDir
+		// 清理压缩包内路径并限制在 targetDir 内
+		name := filepath.Clean(f.Name)
+		if strings.HasPrefix(name, "..") || filepath.IsAbs(name) {
+			return fmt.Errorf("illegal file path in zip: %s", f.Name)
+		}
+		destPath := filepath.Join(targetDir, name)
+
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(destPath, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+			return err
+		}
+
+		if f.IsEncrypted() {
+			f.SetPassword(password)
+		}
+
+		src, err := f.Open()
+		if err != nil {
+			return err
+		}
+
+		dest, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			src.Close()
+			return err
+		}
+
+		_, err = io.Copy(dest, src)
+		src.Close()
+		closeErr := dest.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	return nil
 }
 
 // ZipBytes creates a zip archive from a map of filenames and their contents (bytes)

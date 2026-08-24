@@ -45,27 +45,33 @@ type BackupService interface {
 	ExecuteUserBackup(ctx context.Context, uid int64, configID int64) error
 	ExecuteTaskBackups(ctx context.Context) error
 	NotifyUpdated(uid int64)
+	// ImportBackup imports a backup archive into the target vault with an
+	// overwrite strategy. Takes ownership of zipPath and removes it when done.
+	// 以覆盖策略将备份包导入目标仓库。方法接管 zipPath 并在完成后删除该文件。
+	ImportBackup(ctx context.Context, uid int64, req *dto.BackupImportRequest, zipPath string) (*dto.BackupImportResultDTO, error)
 	Shutdown(ctx context.Context) error
 }
 
 type backupService struct {
-	backupRepo     domain.BackupRepository
-	noteRepo       domain.NoteRepository
-	folderRepo     domain.FolderRepository
-	fileRepo       domain.FileRepository
-	vaultRepo      domain.VaultRepository
-	storageService StorageService
-	storageConfig  *config.StorageConfig
-	tempPath       string
-	logger         *zap.Logger
-	syncTimers     map[int64]*time.Timer
-	timerMu        sync.Mutex
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
-	pendingSyncs   sync.Map                     // key: uid (int64), value: bool
-	runningTasks   map[int64]context.CancelFunc // key: configID
-	runningMu      sync.Mutex
+	backupRepo      domain.BackupRepository
+	noteRepo        domain.NoteRepository
+	folderRepo      domain.FolderRepository
+	fileRepo        domain.FileRepository
+	vaultRepo       domain.VaultRepository
+	settingRepo     domain.SettingRepository
+	noteHistoryRepo domain.NoteHistoryRepository
+	storageService  StorageService
+	storageConfig   *config.StorageConfig
+	tempPath        string
+	logger          *zap.Logger
+	syncTimers      map[int64]*time.Timer
+	timerMu         sync.Mutex
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	pendingSyncs    sync.Map                     // key: uid (int64), value: bool
+	runningTasks    map[int64]context.CancelFunc // key: configID
+	runningMu       sync.Mutex
 }
 
 // NewBackupService creates BackupService instance
@@ -76,6 +82,8 @@ func NewBackupService(
 	folderRepo domain.FolderRepository,
 	fileRepo domain.FileRepository,
 	vaultRepo domain.VaultRepository,
+	settingRepo domain.SettingRepository,
+	noteHistoryRepo domain.NoteHistoryRepository,
 	storageService StorageService,
 	storageConfig *config.StorageConfig,
 	tempPath string,
@@ -86,19 +94,21 @@ func NewBackupService(
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &backupService{
-		backupRepo:     backupRepo,
-		noteRepo:       noteRepo,
-		folderRepo:     folderRepo,
-		fileRepo:       fileRepo,
-		vaultRepo:      vaultRepo,
-		storageService: storageService,
-		storageConfig:  storageConfig,
-		tempPath:       tempPath,
-		logger:         logger,
-		syncTimers:     make(map[int64]*time.Timer),
-		runningTasks:   make(map[int64]context.CancelFunc),
-		ctx:            ctx,
-		cancel:         cancel,
+		backupRepo:      backupRepo,
+		noteRepo:        noteRepo,
+		folderRepo:      folderRepo,
+		fileRepo:        fileRepo,
+		vaultRepo:       vaultRepo,
+		settingRepo:     settingRepo,
+		noteHistoryRepo: noteHistoryRepo,
+		storageService:  storageService,
+		storageConfig:   storageConfig,
+		tempPath:        tempPath,
+		logger:          logger,
+		syncTimers:      make(map[int64]*time.Timer),
+		runningTasks:    make(map[int64]context.CancelFunc),
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 
 	// Startup sweep: reclaim orphaned backup staging files left behind by a
@@ -857,7 +867,9 @@ func (s *backupService) finishTask(ctx context.Context, config *domain.BackupCon
 }
 
 // exportArchiveFiles Export files to be backed up to temp directory for subsequent archiving
+// Includes notes, attachments, vault config (.obsidian) and (for full backups) note history
 // 将需要备份的文件导出到临时目录，用于后续打包
+// 包含笔记、附件、仓库配置 (.obsidian)，全量备份时额外包含笔记历史
 func (s *backupService) exportArchiveFiles(ctx context.Context, uid, vaultID int64, targetDir string, incremental bool, lastRun time.Time) (int64, int64, error) {
 	if vaultID <= 0 {
 		return 0, 0, code.ErrorBackupVaultRequired
@@ -907,7 +919,139 @@ func (s *backupService) exportArchiveFiles(ctx context.Context, uid, vaultID int
 		return nil
 	})
 
-	return totalCount, totalSize, err
+	if err != nil {
+		return totalCount, totalSize, err
+	}
+
+	manifest := &BackupManifest{
+		Version:   BackupManifestVersion,
+		Type:      backupTypeOf(incremental),
+		Vault:     vault.Name,
+		CreatedAt: time.Now(),
+	}
+	manifest.Includes.Notes = true
+	manifest.Includes.Attachments = true
+
+	// Export vault config (.obsidian settings) — included in every archive backup
+	// 导出仓库配置 (.obsidian 配置文件) — 所有归档备份均包含
+	settingsCount, err := s.exportVaultSettings(ctx, uid, vault, targetDir)
+	if err != nil {
+		s.logger.Warn("Failed to export vault config for backup", zap.Error(err))
+		return totalCount, totalSize, err
+	}
+	manifest.Includes.VaultConfig = true
+	manifest.SettingsCount = settingsCount
+
+	// Export note history — full backups only, incremental runs keep the
+	// original notes/attachments-only diff semantics
+	// 导出笔记历史 — 仅全量备份包含；增量备份保持原有的笔记/附件差异语义
+	if !incremental {
+		historyCount, err := s.exportNoteHistory(ctx, uid, vault.ID, targetDir)
+		if err != nil {
+			s.logger.Warn("Failed to export note history for backup", zap.Error(err))
+			return totalCount, totalSize, err
+		}
+		manifest.Includes.NoteHistory = true
+		manifest.HistoryCount = historyCount
+	}
+
+	manifestData, err := json.MarshalIndent(manifest, "", "  ")
+	if err == nil {
+		err = os.WriteFile(filepath.Join(targetDir, BackupManifestFileName), manifestData, 0644)
+	}
+	if err != nil {
+		s.logger.Warn("Failed to write backup manifest", zap.Error(err))
+		return totalCount, totalSize, err
+	}
+
+	return totalCount, totalSize, nil
+}
+
+// exportVaultSettings exports all non-deleted vault config records (.obsidian files)
+// into the staging directory at their original paths.
+// 将所有未删除的仓库配置记录 (.obsidian 文件) 按原始路径导出到暂存目录。
+func (s *backupService) exportVaultSettings(ctx context.Context, uid int64, vault *domain.Vault, targetDir string) (int64, error) {
+	settings, err := s.settingRepo.List(ctx, vault.ID, 1, 1000000, uid, "")
+	if err != nil {
+		return 0, err
+	}
+
+	var count int64
+	for _, st := range settings {
+		if ctx.Err() != nil {
+			return count, ctx.Err()
+		}
+		if st.IsDeleted() || st.Path == "" || st.Content == "" {
+			continue
+		}
+		cleanPath := filepath.Clean(filepath.FromSlash(st.Path))
+		if strings.HasPrefix(cleanPath, "..") || filepath.IsAbs(cleanPath) {
+			continue
+		}
+		destPath := filepath.Join(targetDir, cleanPath)
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			return count, err
+		}
+		if err := os.WriteFile(destPath, []byte(st.Content), 0644); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+// exportNoteHistory exports all note history records of a vault as a single JSON
+// data file inside the staging directory. Entries reference their note by path.
+// 将仓库下所有笔记历史记录导出为暂存目录内的单个 JSON 数据文件。条目通过路径关联笔记。
+func (s *backupService) exportNoteHistory(ctx context.Context, uid, vaultID int64, targetDir string) (int64, error) {
+	histories, err := s.noteHistoryRepo.ListAllByVault(ctx, vaultID, uid)
+	if err != nil {
+		return 0, err
+	}
+	if len(histories) == 0 {
+		return 0, nil
+	}
+
+	notes, err := s.noteRepo.List(ctx, vaultID, 1, 1000000, uid, "", false, "", false, "", "", nil)
+	if err != nil {
+		return 0, err
+	}
+	pathByID := make(map[int64]string, len(notes))
+	for _, n := range notes {
+		pathByID[n.ID] = n.Path
+	}
+
+	var count int64
+	entries := make([]BackupNoteHistoryEntry, 0, len(histories))
+	for _, h := range histories {
+		notePath, ok := pathByID[h.NoteID]
+		if !ok {
+			// The note no longer exists; skip orphaned history records
+			// 笔记已不存在，跳过孤儿历史记录
+			continue
+		}
+		if filepath.Ext(notePath) != ".md" {
+			notePath += ".md"
+		}
+		entries = append(entries, BackupNoteHistoryEntry{
+			Path:          filepath.ToSlash(notePath),
+			Version:       h.Version,
+			ContentHash:   h.ContentHash,
+			DiffPatch:     h.DiffPatch,
+			Content:       h.Content,
+			ClientName:    h.ClientName,
+			ClientType:    h.ClientType,
+			ClientVersion: h.ClientVersion,
+			CreatedAt:     h.CreatedAt,
+		})
+		count++
+	}
+
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return count, err
+	}
+	return count, os.WriteFile(filepath.Join(targetDir, BackupNoteHistoryFileName), data, 0644)
 }
 
 // uploadArchive Upload the archived ZIP file to specified storage target

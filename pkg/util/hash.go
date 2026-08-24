@@ -3,6 +3,8 @@ package util
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"io"
+	"os"
 	"strconv"
 	"unicode/utf16"
 )
@@ -70,4 +72,41 @@ func EncodeHash32Bytes(data []byte) string {
 		}
 	}
 	return strconv.Itoa(int(hash))
+}
+
+// HashFileContent32 computes the same 32-bit hash as EncodeHash32Bytes for a file,
+// streaming from disk: files up to FileHashThreshold are fully hashed, larger
+// files hash only the first and last FileHashSliceSize bytes.
+// HashFileContent32 计算与 EncodeHash32Bytes 一致的文件 32 位哈希，采用流式读取：
+// 不超过 FileHashThreshold 的文件全量哈希，更大文件仅哈希首尾 FileHashSliceSize 字节。
+func HashFileContent32(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	size := info.Size()
+
+	if size <= FileHashThreshold {
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return "", err
+		}
+		return EncodeHash32Bytes(data), nil
+	}
+
+	buf := make([]byte, FileHashSliceSize)
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return "", err
+	}
+	tail := make([]byte, FileHashSliceSize)
+	if _, err := f.ReadAt(tail, size-FileHashSliceSize); err != nil {
+		return "", err
+	}
+	return EncodeHash32Bytes(append(buf, tail...)), nil
 }

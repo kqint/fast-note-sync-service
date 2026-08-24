@@ -2,6 +2,8 @@ package api_router
 
 import (
 	"context"
+	"io"
+	"os"
 
 	"github.com/gin-gonic/gin"
 	"github.com/haierkeys/fast-note-sync-service/internal/app"
@@ -205,6 +207,87 @@ func (h *BackupHandler) Execute(c *gin.Context) {
 	}
 
 	response.ToResponse(code.Success.WithDetails("Backup task completed, check history for details"))
+}
+
+// Import imports a backup archive into the target vault (overwrite strategy)
+// @Summary Import a backup archive
+// @Description Imports notes/attachments, vault config (.obsidian) and note history from an uploaded zip archive with a full-overwrite strategy
+// @Tags Backup
+// @Security UserAuthToken
+// @Accept multipart/form-data
+// @Produce json
+// @Param file formData file true "Backup archive (.zip)"
+// @Param vault formData string true "Target vault name"
+// @Param password formData string false "Archive password"
+// @Param includeNotes formData boolean false "Import notes & attachments"
+// @Param includeVaultConfig formData boolean false "Import vault config (.obsidian)"
+// @Param includeNoteHistory formData boolean false "Import note history (requires includeNotes)"
+// @Success 200 {object} pkgapp.Res{data=dto.BackupImportResultDTO} "Success"
+// @Failure 400 {object} pkgapp.Res "Invalid Params"
+// @Failure 401 {object} pkgapp.Res "Token Required"
+// @Failure 500 {object} pkgapp.Res "Internal Server Error"
+// @Router /api/backup/import [post]
+func (h *BackupHandler) Import(c *gin.Context) {
+	response := pkgapp.NewResponse(c)
+
+	uid := pkgapp.GetUID(c)
+	if uid == 0 {
+		response.ToResponse(code.ErrorNotUserAuthToken)
+		return
+	}
+
+	params := &dto.BackupImportRequest{
+		Vault:              c.PostForm("vault"),
+		Password:           c.PostForm("password"),
+		IncludeNotes:       c.PostForm("includeNotes") == "true",
+		IncludeVaultConfig: c.PostForm("includeVaultConfig") == "true",
+		IncludeNoteHistory: c.PostForm("includeNoteHistory") == "true",
+	}
+	if params.Vault == "" {
+		response.ToResponse(code.ErrorBackupVaultRequired)
+		return
+	}
+
+	fileHeader, err := c.FormFile("file")
+	if err != nil {
+		response.ToResponse(code.ErrorBackupImportFileEmpty.WithDetails(err.Error()))
+		return
+	}
+
+	// Stage the upload outside the service so the request stream is fully
+	// consumed here; ImportBackup takes ownership of the temp file afterwards.
+	// 先在处理层暂存上传文件以完整消费请求流；随后由 ImportBackup 接管该临时文件。
+	tmpFile, err := os.CreateTemp("", "fns-backup-import-*.zip")
+	if err != nil {
+		response.ToResponse(code.ErrorServerInternal.WithDetails(err.Error()))
+		return
+	}
+	tmpPath := tmpFile.Name()
+
+	if err := func() error {
+		defer tmpFile.Close()
+		src, err := fileHeader.Open()
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		_, err = io.Copy(tmpFile, src)
+		return err
+	}(); err != nil {
+		os.Remove(tmpPath)
+		h.logError(c.Request.Context(), "BackupHandler.Import.SaveUpload", err)
+		response.ToResponse(code.ErrorServerInternal.WithDetails(err.Error()))
+		return
+	}
+
+	result, err := h.App.BackupService.ImportBackup(c.Request.Context(), uid, params, tmpPath)
+	if err != nil {
+		h.logError(c.Request.Context(), "BackupHandler.Import", err)
+		apperrors.ErrorResponse(c, err)
+		return
+	}
+
+	response.ToResponse(code.Success.WithData(result))
 }
 
 func (h *BackupHandler) logError(ctx context.Context, method string, err error) {
