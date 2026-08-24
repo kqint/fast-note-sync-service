@@ -19,6 +19,7 @@ import (
 	"github.com/haierkeys/fast-note-sync-service/pkg/code"
 	"github.com/haierkeys/fast-note-sync-service/pkg/logger"
 	"github.com/haierkeys/fast-note-sync-service/pkg/safego"
+	"github.com/haierkeys/fast-note-sync-service/pkg/syncgate"
 	"github.com/haierkeys/fast-note-sync-service/pkg/timex"
 	"github.com/haierkeys/fast-note-sync-service/pkg/util"
 
@@ -261,6 +262,15 @@ func (h *FileWSHandler) FileUploadChunkBinary(c *pkgapp.WebsocketClient, data []
 		c.ToResponse(code.ErrorFileUploadSessionNotFound.WithData(map[string]string{
 			"sessionID": sessionID,
 		}))
+		return
+	}
+
+	// Binary frames bypass the interceptor chain, so the vault sync pause gate
+	// (data import maintenance) is enforced here explicitly.
+	// 二进制帧不经过拦截器链，因此在此显式执行仓库同步暂停开关（数据导入维护）。
+	if syncgate.IsPaused(c.User.UID, session.Vault) {
+		h.logWarn(c, "FileUploadChunkBinary: vault sync paused during data import")
+		c.ToResponse(code.ErrorVaultSyncPaused.WithDetails("Vault sync is paused during data import: "+session.Vault))
 		return
 	}
 

@@ -242,6 +242,7 @@ func (h *BackupHandler) Import(c *gin.Context) {
 		IncludeNotes:       c.PostForm("includeNotes") == "true",
 		IncludeVaultConfig: c.PostForm("includeVaultConfig") == "true",
 		IncludeNoteHistory: c.PostForm("includeNoteHistory") == "true",
+		AllowPartial:       c.PostForm("allowPartial") == "true",
 	}
 	if params.Vault == "" {
 		response.ToResponse(code.ErrorBackupVaultRequired)

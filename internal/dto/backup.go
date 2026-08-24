@@ -40,6 +40,23 @@ type BackupImportRequest struct {
 	IncludeNotes       bool   `json:"includeNotes" form:"includeNotes" example:"true"`       // Import notes & attachments // 导入笔记和附件
 	IncludeVaultConfig bool   `json:"includeVaultConfig" form:"includeVaultConfig" example:"false"` // Import vault config (.obsidian) // 导入仓库配置 (.obsidian)
 	IncludeNoteHistory bool   `json:"includeNoteHistory" form:"includeNoteHistory" example:"false"` // Import note history (requires IncludeNotes) // 导入笔记历史 (需勾选笔记和附件)
+	AllowPartial       bool   `json:"allowPartial" form:"allowPartial" example:"false"`      // Allow importing only the sections actually present // 允许仅导入备份包中实际存在的部分
+}
+
+// BackupImportAvailabilityDTO 备份包中各部分的存在情况
+// BackupImportAvailabilityDTO availability of each section inside the archive
+type BackupImportAvailabilityDTO struct {
+	Notes       bool `json:"notes"`       // Notes & attachments present // 存在笔记和附件
+	VaultConfig bool `json:"vaultConfig"` // Vault config present // 存在仓库配置
+	NoteHistory bool `json:"noteHistory"` // Note history present // 存在笔记历史
+}
+
+// BackupImportValidateDTO 备份包校验结果（所选内容缺失时返回）
+// BackupImportValidateDTO archive validation result (returned when requested sections are missing)
+type BackupImportValidateDTO struct {
+	Available   BackupImportAvailabilityDTO `json:"available"`        // Sections present in the archive // 备份包中存在的部分
+	Missing     []string                    `json:"missing"`          // Requested but missing sections: notes | vaultConfig | noteHistory // 已勾选但缺失的部分
+	SourceVault string                      `json:"sourceVault,omitempty"` // Source vault from manifest // 清单中的来源仓库名称
 }
 
 // BackupImportResultDTO 备份包导入结果

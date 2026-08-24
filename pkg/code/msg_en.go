@@ -136,4 +136,7 @@ var en_messages = map[int]string{
 	541: "Failed to extract backup archive (check the file and password)",
 	542: "Invalid import options: select at least one section, note history also requires notes & attachments",
 	543: "Unsupported backup archive version, please upgrade the service",
+	544: "Invalid backup archive (missing manifest or no importable content)",
+	545: "Requested sections are missing in the backup archive, you may import the available sections only",
+	546: "Vault sync is paused during data import, please try again later",
 }

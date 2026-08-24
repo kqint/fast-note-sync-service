@@ -66,3 +66,24 @@ func TestReadBackupManifest(t *testing.T) {
 		t.Fatalf("manifest mismatch: %+v", m)
 	}
 }
+
+func TestCountBackupHistoryEntries(t *testing.T) {
+	dir := t.TempDir()
+	if got := countBackupHistoryEntries(dir); got != 0 {
+		t.Fatalf("expected 0 entries for missing file, got %d", got)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, BackupNoteHistoryFileName), []byte(`[{"path":"a.md","version":1,"content":"x"},{"path":"a.md","version":2,"content":"y"}]`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := countBackupHistoryEntries(dir); got != 2 {
+		t.Fatalf("expected 2 entries, got %d", got)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, BackupNoteHistoryFileName), []byte(`not-json`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := countBackupHistoryEntries(dir); got != 0 {
+		t.Fatalf("expected 0 entries for invalid json, got %d", got)
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"github.com/haierkeys/fast-note-sync-service/internal/domain"
 	"github.com/haierkeys/fast-note-sync-service/internal/dto"
 	"github.com/haierkeys/fast-note-sync-service/pkg/code"
+	"github.com/haierkeys/fast-note-sync-service/pkg/syncgate"
 	"github.com/haierkeys/fast-note-sync-service/pkg/timex"
 	"github.com/haierkeys/fast-note-sync-service/pkg/util"
 	"go.uber.org/zap"
@@ -21,15 +22,25 @@ import (
 )
 
 // ImportBackup imports a backup archive into the target vault.
+// Zero-trust validation: the archive must contain fns-backup.manifest.json, and
+// every requested section must actually be present; otherwise the caller may
+// retry with AllowPartial to import only the available sections.
 // Current strategy: full overwrite — existing items with the same path are
 // replaced by archive content, missing items are created; unrelated current
 // data is left untouched. Note history is restored per note: existing versions
 // of notes present in the archive are cleared before inserting archived ones.
 //
+// Vault sync (WebSocket) is paused for the target vault during the import to
+// prevent concurrent multi-device writes from interleaving with imported data.
+//
 // 导入备份包到目标仓库。
+// 零信任校验：备份包必须包含 fns-backup.manifest.json，且所有勾选的部分必须真实存在；
+// 否则调用方可携带 AllowPartial 重试，仅导入实际存在的部分。
 // 当前策略：全部覆盖 —— 同名路径的现有数据被备份包内容替换，缺失的条目被创建；
 // 与备份无关的现有数据保持不变。笔记历史按笔记恢复：先清除存在于备份包中的
 // 笔记的现有历史版本，再写入归档的历史版本。
+//
+// 导入期间会暂停目标仓库的 WebSocket 同步，防止多端并发写入与导入数据交叉。
 func (s *backupService) ImportBackup(ctx context.Context, uid int64, req *dto.BackupImportRequest, zipPath string) (*dto.BackupImportResultDTO, error) {
 	defer os.Remove(zipPath)
 
@@ -77,14 +88,65 @@ func (s *backupService) ImportBackup(ctx context.Context, uid int64, req *dto.Ba
 		return nil, code.ErrorBackupImportZipFailed.WithDetails(err.Error())
 	}
 
+	// Zero trust: the manifest is mandatory — without it the archive origin and
+	// layout cannot be verified.
+	// 零信任：清单文件必须存在 —— 缺少清单则无法验证备份包来源与结构。
 	manifest := s.readBackupManifest(extractDir)
-	if manifest != nil && manifest.Version > BackupManifestVersion {
+	if manifest == nil {
+		return nil, code.ErrorBackupImportInvalidArchive.WithDetails("missing " + BackupManifestFileName)
+	}
+	if manifest.Version > BackupManifestVersion {
 		return nil, code.ErrorBackupImportUnsupported
 	}
 
 	notePaths, filePaths, settingPaths := classifyArchiveFiles(extractDir)
+	available := dto.BackupImportAvailabilityDTO{
+		Notes:       len(notePaths)+len(filePaths) > 0,
+		VaultConfig: len(settingPaths) > 0,
+		NoteHistory: countBackupHistoryEntries(extractDir) > 0,
+	}
+
+	// Zero trust: verify that every requested section actually exists in the
+	// archive. On mismatch the client decides whether to import partially.
+	// 零信任：校验勾选的部分在备份包中真实存在。缺失时由客户端决定是否部分导入。
+	var missing []string
+	if req.IncludeNotes && !available.Notes {
+		missing = append(missing, "notes")
+	}
+	if req.IncludeVaultConfig && !available.VaultConfig {
+		missing = append(missing, "vaultConfig")
+	}
+	if req.IncludeNoteHistory && !available.NoteHistory {
+		missing = append(missing, "noteHistory")
+	}
+	if len(missing) > 0 && !req.AllowPartial {
+		return nil, code.ErrorBackupImportSectionMissing.
+			WithData(dto.BackupImportValidateDTO{
+				Available:   available,
+				Missing:     missing,
+				SourceVault: manifest.Vault,
+			})
+	}
+	// Partial import: restrict the request to sections that really exist;
+	// if nothing remains to import, treat it as an empty archive.
+	// 部分导入：将请求限定为实际存在的部分；若没有任何可导入内容则视为空备份包。
+	if !available.Notes && !available.VaultConfig && !available.NoteHistory {
+		return nil, code.ErrorBackupImportInvalidArchive.WithDetails("archive contains no importable content")
+	}
+	req.IncludeNotes = req.IncludeNotes && available.Notes
+	req.IncludeVaultConfig = req.IncludeVaultConfig && available.VaultConfig
+	req.IncludeNoteHistory = req.IncludeNoteHistory && available.NoteHistory
+	if !req.IncludeNotes && !req.IncludeVaultConfig && !req.IncludeNoteHistory {
+		return nil, code.ErrorBackupImportOptionInvalid
+	}
 
 	result := &dto.BackupImportResultDTO{Vault: vault.Name}
+
+	// Pause sync for the target vault while importing so concurrent multi-device
+	// traffic cannot interleave with imported writes.
+	// 导入期间暂停目标仓库同步，防止多端并发流量与导入写入交叉。
+	syncgate.Pause(uid, vault.Name)
+	defer syncgate.Resume(uid, vault.Name)
 
 	// 1. Notes & attachments (option 1)
 	// 1. 笔记和附件 (选项 1)
@@ -145,6 +207,20 @@ func (s *backupService) readBackupManifest(extractDir string) *BackupManifest {
 		return nil
 	}
 	return &manifest
+}
+
+// countBackupHistoryEntries counts entries in the archived note history data file.
+// 统计备份包中笔记历史数据文件的条目数。
+func countBackupHistoryEntries(extractDir string) int {
+	data, err := os.ReadFile(filepath.Join(extractDir, BackupNoteHistoryFileName))
+	if err != nil {
+		return 0
+	}
+	var entries []BackupNoteHistoryEntry
+	if json.Unmarshal(data, &entries) != nil {
+		return 0
+	}
+	return len(entries)
 }
 
 // classifyArchiveFiles splits extracted files into notes (*.md), attachments and
