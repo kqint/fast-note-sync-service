@@ -141,7 +141,6 @@ var (
 	ErrorBackupImportFileEmpty     = NewError(540)
 	ErrorBackupImportZipFailed     = NewError(541)
 	ErrorBackupImportOptionInvalid = NewError(542)
-	ErrorBackupImportUnsupported   = NewError(543)
 	ErrorBackupImportInvalidArchive   = NewError(544)
 	ErrorBackupImportSectionMissing   = NewError(545)
 	ErrorVaultSyncPaused              = NewError(546)

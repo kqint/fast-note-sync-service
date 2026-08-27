@@ -54,9 +54,8 @@ type BackupImportAvailabilityDTO struct {
 // BackupImportValidateDTO 备份包校验结果（所选内容缺失时返回）
 // BackupImportValidateDTO archive validation result (returned when requested sections are missing)
 type BackupImportValidateDTO struct {
-	Available   BackupImportAvailabilityDTO `json:"available"`        // Sections present in the archive // 备份包中存在的部分
-	Missing     []string                    `json:"missing"`          // Requested but missing sections: notes | vaultConfig | noteHistory // 已勾选但缺失的部分
-	SourceVault string                      `json:"sourceVault,omitempty"` // Source vault from manifest // 清单中的来源仓库名称
+	Available BackupImportAvailabilityDTO `json:"available"` // Sections present in the archive // 备份包中存在的部分
+	Missing   []string                    `json:"missing"`   // Requested but missing sections: notes | vaultConfig | noteHistory // 已勾选但缺失的部分
 }
 
 // BackupImportResultDTO 备份包导入结果

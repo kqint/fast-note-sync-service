@@ -923,45 +923,21 @@ func (s *backupService) exportArchiveFiles(ctx context.Context, uid, vaultID int
 		return totalCount, totalSize, err
 	}
 
-	manifest := &BackupManifest{
-		Version:   BackupManifestVersion,
-		Type:      backupTypeOf(incremental),
-		Vault:     vault.Name,
-		CreatedAt: time.Now(),
-	}
-	manifest.Includes.Notes = true
-	manifest.Includes.Attachments = true
-
 	// Export vault config (.obsidian settings) — included in every archive backup
 	// 导出仓库配置 (.obsidian 配置文件) — 所有归档备份均包含
-	settingsCount, err := s.exportVaultSettings(ctx, uid, vault, targetDir)
-	if err != nil {
+	if _, err := s.exportVaultSettings(ctx, uid, vault, targetDir); err != nil {
 		s.logger.Warn("Failed to export vault config for backup", zap.Error(err))
 		return totalCount, totalSize, err
 	}
-	manifest.Includes.VaultConfig = true
-	manifest.SettingsCount = settingsCount
 
 	// Export note history — full backups only, incremental runs keep the
-	// original notes/attachments-only diff semantics
-	// 导出笔记历史 — 仅全量备份包含；增量备份保持原有的笔记/附件差异语义
+	// original notes/attachments-only diff semantics. Written under ".fns/".
+	// 导出笔记历史 — 仅全量备份包含；增量备份保持原有的笔记/附件差异语义。写入 ".fns/" 目录。
 	if !incremental {
-		historyCount, err := s.exportNoteHistory(ctx, uid, vault.ID, targetDir)
-		if err != nil {
+		if _, err := s.exportNoteHistory(ctx, uid, vault.ID, targetDir); err != nil {
 			s.logger.Warn("Failed to export note history for backup", zap.Error(err))
 			return totalCount, totalSize, err
 		}
-		manifest.Includes.NoteHistory = true
-		manifest.HistoryCount = historyCount
-	}
-
-	manifestData, err := json.MarshalIndent(manifest, "", "  ")
-	if err == nil {
-		err = os.WriteFile(filepath.Join(targetDir, BackupManifestFileName), manifestData, 0644)
-	}
-	if err != nil {
-		s.logger.Warn("Failed to write backup manifest", zap.Error(err))
-		return totalCount, totalSize, err
 	}
 
 	return totalCount, totalSize, nil
@@ -1001,8 +977,10 @@ func (s *backupService) exportVaultSettings(ctx context.Context, uid int64, vaul
 }
 
 // exportNoteHistory exports all note history records of a vault as a single JSON
-// data file inside the staging directory. Entries reference their note by path.
-// 将仓库下所有笔记历史记录导出为暂存目录内的单个 JSON 数据文件。条目通过路径关联笔记。
+// data file inside the staging directory (.fns/note_history.json). Entries
+// reference their note by path.
+// 将仓库下所有笔记历史记录导出为暂存目录内的单个 JSON 数据文件
+// (.fns/note_history.json)。条目通过路径关联笔记。
 func (s *backupService) exportNoteHistory(ctx context.Context, uid, vaultID int64, targetDir string) (int64, error) {
 	histories, err := s.noteHistoryRepo.ListAllByVault(ctx, vaultID, uid)
 	if err != nil {
@@ -1051,7 +1029,11 @@ func (s *backupService) exportNoteHistory(ctx context.Context, uid, vaultID int6
 	if err != nil {
 		return count, err
 	}
-	return count, os.WriteFile(filepath.Join(targetDir, BackupNoteHistoryFileName), data, 0644)
+	metaDir := filepath.Join(targetDir, filepath.FromSlash(BackupMetaDirPrefix))
+	if err := os.MkdirAll(metaDir, 0755); err != nil {
+		return count, err
+	}
+	return count, os.WriteFile(filepath.Join(metaDir, "note_history.json"), data, 0644)
 }
 
 // uploadArchive Upload the archived ZIP file to specified storage target

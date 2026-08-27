@@ -88,17 +88,10 @@ func (s *backupService) ImportBackup(ctx context.Context, uid int64, req *dto.Ba
 		return nil, code.ErrorBackupImportZipFailed.WithDetails(err.Error())
 	}
 
-	// Zero trust: the manifest is mandatory — without it the archive origin and
-	// layout cannot be verified.
-	// 零信任：清单文件必须存在 —— 缺少清单则无法验证备份包来源与结构。
-	manifest := s.readBackupManifest(extractDir)
-	if manifest == nil {
-		return nil, code.ErrorBackupImportInvalidArchive.WithDetails("missing " + BackupManifestFileName)
-	}
-	if manifest.Version > BackupManifestVersion {
-		return nil, code.ErrorBackupImportUnsupported
-	}
-
+	// Zero trust: verify which sections actually exist in the archive. The
+	// archive holds no manifest, so availability is derived by scanning files.
+	// 零信任：校验备份包中实际存在的部分。归档内无清单文件，
+	// 可用性通过直接扫描归档内的文件确定。
 	notePaths, filePaths, settingPaths := classifyArchiveFiles(extractDir)
 	available := dto.BackupImportAvailabilityDTO{
 		Notes:       len(notePaths)+len(filePaths) > 0,
@@ -122,9 +115,8 @@ func (s *backupService) ImportBackup(ctx context.Context, uid int64, req *dto.Ba
 	if len(missing) > 0 && !req.AllowPartial {
 		return nil, code.ErrorBackupImportSectionMissing.
 			WithData(dto.BackupImportValidateDTO{
-				Available:   available,
-				Missing:     missing,
-				SourceVault: manifest.Vault,
+				Available: available,
+				Missing:   missing,
 			})
 	}
 	// Partial import: restrict the request to sections that really exist;
@@ -195,24 +187,15 @@ func (s *backupService) ImportBackup(ctx context.Context, uid int64, req *dto.Ba
 	return result, nil
 }
 
-// readBackupManifest reads the optional backup manifest file
-// 读取可选的备份清单文件
-func (s *backupService) readBackupManifest(extractDir string) *BackupManifest {
-	data, err := os.ReadFile(filepath.Join(extractDir, BackupManifestFileName))
-	if err != nil {
-		return nil
-	}
-	var manifest BackupManifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil
-	}
-	return &manifest
-}
+// Note: archives carry no manifest, and import validation derives section
+// availability by scanning the extracted files directly (classifyArchiveFiles).
+// 说明：归档不携带清单文件，导入端通过直接扫描解压文件确定各部分可用性（见 classifyArchiveFiles）。
 
-// countBackupHistoryEntries counts entries in the archived note history data file.
-// 统计备份包中笔记历史数据文件的条目数。
+// countBackupHistoryEntries counts entries in the archived note history data file
+// (.fns/note_history.json).
+// 统计备份包中笔记历史数据文件 (.fns/note_history.json) 的条目数。
 func countBackupHistoryEntries(extractDir string) int {
-	data, err := os.ReadFile(filepath.Join(extractDir, BackupNoteHistoryFileName))
+	data, err := os.ReadFile(filepath.Join(extractDir, filepath.FromSlash(BackupNoteHistoryFileName)))
 	if err != nil {
 		return 0
 	}
@@ -224,8 +207,10 @@ func countBackupHistoryEntries(extractDir string) int {
 }
 
 // classifyArchiveFiles splits extracted files into notes (*.md), attachments and
-// vault config (.obsidian/) buckets by their archive-relative path.
+// vault config (.obsidian/) buckets by their archive-relative path. Files under
+// the reserved ".fns/" metadata namespace are skipped entirely.
 // 根据压缩包内相对路径将解压文件分为笔记 (*.md)、附件与仓库配置 (.obsidian/) 三类。
+// 保留的 ".fns/" 元数据命名空间内的文件会被整体跳过。
 func classifyArchiveFiles(extractDir string) (notes, files []string, settings []string) {
 	_ = filepath.Walk(extractDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -237,9 +222,9 @@ func classifyArchiveFiles(extractDir string) (notes, files []string, settings []
 		}
 		rel = filepath.ToSlash(rel)
 		switch {
-		case rel == BackupManifestFileName, rel == BackupNoteHistoryFileName:
-			// Archive metadata files are not user data
-			// 归档元数据文件不属于用户数据
+		case strings.HasPrefix(rel, BackupMetaDirPrefix):
+			// Archive metadata (.fns/) is not user data
+			// 归档元数据 (.fns/) 不属于用户数据
 			return nil
 		case strings.HasPrefix(rel, VaultConfigDirPrefix):
 			settings = append(settings, rel)
@@ -517,11 +502,11 @@ func (s *backupService) importVaultSettings(ctx context.Context, uid, vaultID in
 // 恢复归档的笔记历史版本。对于备份包中存在历史条目的笔记，先删除其当前历史版本
 // （覆盖策略），再按原始元数据重建归档条目；内容/补丁 sidecar 文件由仓储层写入。
 func (s *backupService) importNoteHistory(ctx context.Context, uid, vaultID int64, extractDir string) (int64, int64, error) {
-	data, err := os.ReadFile(filepath.Join(extractDir, BackupNoteHistoryFileName))
+	data, err := os.ReadFile(filepath.Join(extractDir, filepath.FromSlash(BackupNoteHistoryFileName)))
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Archive contains no history section (legacy or incremental backup)
-			// 备份包不含历史部分（旧格式或增量备份）
+			// Archive contains no history section (incremental backup or none available)
+			// 备份包不含历史部分（增量备份或不可用）
 			return 0, 0, nil
 		}
 		return 0, 0, err

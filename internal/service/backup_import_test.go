@@ -4,8 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"go.uber.org/zap"
 )
 
 func TestClassifyArchiveFiles(t *testing.T) {
@@ -24,7 +22,6 @@ func TestClassifyArchiveFiles(t *testing.T) {
 	write("img.png", "pngdata")
 	write(".obsidian/app.json", "{}")
 	write(".obsidian/themes/x.css", "body{}")
-	write(BackupManifestFileName, "{}")
 	write(BackupNoteHistoryFileName, "[]")
 
 	notes, files, settings := classifyArchiveFiles(dir)
@@ -45,25 +42,26 @@ func TestClassifyArchiveFiles(t *testing.T) {
 	}
 }
 
-func TestReadBackupManifest(t *testing.T) {
+func TestClassifyArchiveFiles_SkipsFnsDir(t *testing.T) {
 	dir := t.TempDir()
-
-	s := &backupService{logger: zap.NewNop()}
-	if m := s.readBackupManifest(dir); m != nil {
-		t.Fatalf("expected nil manifest for missing file, got %+v", m)
+	write := func(rel string, content string) {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	data := []byte(`{"version":1,"type":"full","vault":"myVault","includes":{"notes":true,"attachments":true,"vaultConfig":true,"noteHistory":true},"settingsCount":3,"historyCount":7}`)
-	if err := os.WriteFile(filepath.Join(dir, BackupManifestFileName), data, 0644); err != nil {
-		t.Fatal(err)
-	}
+	write("note.md", "# n")
+	write(BackupNoteHistoryFileName, "[]")
+	// 用户自定义文件也不能利用 .fns 命名空间逃逸
+	write(".fns/other.txt", "meta")
 
-	m := s.readBackupManifest(dir)
-	if m == nil {
-		t.Fatal("expected manifest, got nil")
-	}
-	if m.Version != BackupManifestVersion || m.Vault != "myVault" || !m.Includes.NoteHistory || m.HistoryCount != 7 {
-		t.Fatalf("manifest mismatch: %+v", m)
+	notes, files, settings := classifyArchiveFiles(dir)
+	if len(notes) != 1 || len(files) != 0 || len(settings) != 0 {
+		t.Fatalf("unexpected buckets: notes=%v files=%v settings=%v", notes, files, settings)
 	}
 }
 
@@ -73,14 +71,19 @@ func TestCountBackupHistoryEntries(t *testing.T) {
 		t.Fatalf("expected 0 entries for missing file, got %d", got)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, BackupNoteHistoryFileName), []byte(`[{"path":"a.md","version":1,"content":"x"},{"path":"a.md","version":2,"content":"y"}]`), 0644); err != nil {
+	metaDir := filepath.Join(dir, filepath.FromSlash(BackupMetaDirPrefix))
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(`[{"path":"a.md","version":1,"content":"x"},{"path":"a.md","version":2,"content":"y"}]`)
+	if err := os.WriteFile(filepath.Join(metaDir, "note_history.json"), data, 0644); err != nil {
 		t.Fatal(err)
 	}
 	if got := countBackupHistoryEntries(dir); got != 2 {
 		t.Fatalf("expected 2 entries, got %d", got)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, BackupNoteHistoryFileName), []byte(`not-json`), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(metaDir, "note_history.json"), []byte(`not-json`), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if got := countBackupHistoryEntries(dir); got != 0 {
