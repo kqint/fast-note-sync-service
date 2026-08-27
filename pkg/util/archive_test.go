@@ -2,9 +2,13 @@ package util
 
 import (
 	"archive/zip"
+	"encoding/base64"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 func TestZipUnzipRoundTripWithPassword(t *testing.T) {
@@ -103,4 +107,79 @@ func buildEvilZip(path string, entryName string) error {
 		return err
 	}
 	return w.Close()
+}
+
+// TestUnzipWithPassword_Bzip2Zstd verifies that archives compressed with Bzip2 (12)
+// and Zstandard (93) can be extracted after the extra decompressors are registered.
+// The Bzip2 fixture is a real archive generated once by Python's bz2-backend zipfile
+// (no Go bzip2 writer is available in the stdlib); Zstandard uses klauspost.
+// TestUnzipWithPassword_Bzip2Zstd 校验注册补充解压器后 Bzip2(12) 与 Zstandard(93)
+// 压缩的归档可正常解压。Bzip2 样本由 Python bz2 后端 zipfile 生成一次并内嵌
+// （Go 标准库没有 bzip2 写入器）；Zstandard 使用 klauspost 库生成。
+func TestUnzipWithPassword_Bzip2Zstd(t *testing.T) {
+	dir := t.TempDir()
+
+	// Bzip2 fixture entry: data.txt -> "hello bzip-ish"
+	// Bzip2 样本条目：data.txt -> "hello bzip-ish"
+	bzip2Zip := filepath.Join(dir, "bzip2.zip")
+	fixture, err := base64.StdEncoding.DecodeString("UEsDBC4AAAAMACKCG11Qq7L2NAAAAA4AAAAIAAAAZGF0YS50eHRCWmg5MUFZJlNZVwLepQAAAhGAQAISZMgQIAAhoA00IBppo0xg5YUEF4u5IpwoSCuBb1KAUEsBAi4ALgAAAAwAIoIbXVCrsvY0AAAADgAAAAgAAAAAAAAAAAAAAIABAAAAAGRhdGEudHh0UEsFBgAAAAABAAEANgAAAFoAAAAAAA==")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bzip2Zip, fixture, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Zstandard archive built with klauspost/compress/zstd (stdlib archive/zip
+	// cannot write method 93); register it as a writer-side compressor.
+	// 使用 klauspost/compress/zstd 构造 Zstandard 归档（stdlib archive/zip 无法写入
+	// 方法 93），将其注册为写入侧压缩器。
+	zstdZip := filepath.Join(dir, "zstd.zip")
+	{
+		zip.RegisterCompressor(93, func(w io.Writer) (io.WriteCloser, error) {
+			return zstd.NewWriter(w)
+		})
+		f, err := os.Create(zstdZip)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := zip.NewWriter(f)
+		h := &zip.FileHeader{Name: "data.txt", Method: 93}
+		h.SetMode(0644)
+		entry, err := w.CreateHeader(h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write([]byte("hello bzip-ish")); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+	}
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"bzip2", bzip2Zip},
+		{"zstd", zstdZip},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			outDir := filepath.Join(dir, "out-"+tc.name)
+			if err := UnzipWithPassword(tc.path, outDir, ""); err != nil {
+				t.Fatalf("UnzipWithPassword(%s) error = %v", tc.name, err)
+			}
+			got, err := os.ReadFile(filepath.Join(outDir, "data.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "hello bzip-ish" {
+				t.Fatalf("content mismatch: %q", string(got))
+			}
+		})
+	}
 }

@@ -1,14 +1,21 @@
 package util
 
 import (
+	"compress/bzip2"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/yeka/zip"
 )
+
+// archiveDecompressorsOnce guards the one-time global decompressor registration.
+// archiveDecompressorsOnce 保证一次性全局解压器注册。
+var archiveDecompressorsOnce sync.Once
 
 // Zip compresses files or directories into a zip file
 // source: path to file or directory
@@ -103,9 +110,13 @@ func ZipWithPassword(source, target, password string) error {
 // UnzipWithPassword extracts a zip archive into the target directory,
 // optionally decrypting password-protected entries (ZipCrypto and AES).
 // Paths inside the archive are cleaned to prevent Zip Slip attacks.
+// Supported compression methods: Store, Deflate, Bzip2 and Zstandard.
 // UnzipWithPassword 将 zip 压缩包解压到目标目录，支持加密条目（ZipCrypto 与 AES）。
 // 压缩包内的路径会被清理以防止 Zip Slip 攻击。
+// 支持的压缩算法：Store、Deflate、Bzip2 与 Zstandard。
 func UnzipWithPassword(source, targetDir, password string) error {
+	registerArchiveDecompressors()
+
 	reader, err := zip.OpenReader(source)
 	if err != nil {
 		return err
@@ -159,6 +170,47 @@ func UnzipWithPassword(source, targetDir, password string) error {
 	}
 	return nil
 }
+
+// registerArchiveDecompressors registers decompressors beyond the yeka/zip
+// builtins (Store/Deflate): Bzip2 (12, stdlib) and Zstandard (93, klauspost).
+// The registration is process-global and done exactly once.
+// registerArchiveDecompressors 在 yeka/zip 内置算法（Store/Deflate）之外补充注册
+// Bzip2 (12, 标准库) 与 Zstandard (93, klauspost/compress)。进程级全局注册且仅一次。
+func registerArchiveDecompressors() {
+	archiveDecompressorsOnce.Do(func() {
+		zip.RegisterDecompressor(12, func(r io.Reader) io.ReadCloser {
+			return io.NopCloser(bzip2.NewReader(r))
+		})
+		zip.RegisterDecompressor(93, func(r io.Reader) io.ReadCloser {
+			zr, err := zstd.NewReader(r)
+			if err != nil {
+				return &errReadCloser{err: err}
+			}
+			return &zstdReadCloser{Decoder: zr}
+		})
+	})
+}
+
+// zstdReadCloser adapts *zstd.Decoder to io.ReadCloser (Close returns error).
+// zstdReadCloser 将 *zstd.Decoder 适配为 io.ReadCloser（Close 返回错误）。
+type zstdReadCloser struct {
+	*zstd.Decoder
+}
+
+func (z *zstdReadCloser) Close() error {
+	z.Decoder.Close()
+	return nil
+}
+
+// errReadCloser is a minimal io.ReadCloser that always fails with its error,
+// used when a decompressor cannot be initialized.
+// errReadCloser 是一个总是返回预设错误的 io.ReadCloser，用于解压器初始化失败场景。
+type errReadCloser struct {
+	err error
+}
+
+func (e *errReadCloser) Read([]byte) (int, error) { return 0, e.err }
+func (e *errReadCloser) Close() error             { return nil }
 
 // ZipBytes creates a zip archive from a map of filenames and their contents (bytes)
 func ZipBytes(files map[string][]byte, target string) error {
