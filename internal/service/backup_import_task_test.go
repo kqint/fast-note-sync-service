@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/haierkeys/fast-note-sync-service/internal/config"
 	"github.com/haierkeys/fast-note-sync-service/internal/domain"
 	"github.com/haierkeys/fast-note-sync-service/internal/domain/mocks"
 	"github.com/haierkeys/fast-note-sync-service/internal/dto"
@@ -256,8 +257,11 @@ func TestImportTask_UnknownTask(t *testing.T) {
 // 超大小限制 → 同步拒绝 548。
 func TestImportTask_SizeLimit(t *testing.T) {
 	s, _, _, _, _, _, _ := newImportTestService(t)
-	s.importLimitOn = true
-	s.importLimitBytes = 4
+	enable := true
+	s.appSettings = &config.AppSettings{
+		BackupImportSizeLimitEnabled: &enable,
+		BackupImportSizeLimit:        "4B",
+	}
 
 	zipPath := buildNotesOnlyZip(t, t.TempDir())
 	info, _ := os.Stat(zipPath)

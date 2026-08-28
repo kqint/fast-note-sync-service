@@ -130,16 +130,20 @@ func (s *backupService) SubmitImportBackup(ctx context.Context, uid int64, req *
 	}
 
 	// Authoritative size check (layer 3; handler already checked Content-Length
-	// and multipart header earlier).
+	// and multipart header earlier). Resolved live from app settings so
+	// system-settings changes take effect immediately.
 	// 权威大小校验（第三层；handler 已在前两处检查 Content-Length 与 multipart 头）。
-	if s.importLimitOn {
-		info, err := os.Stat(zipPath)
-		if err != nil {
-			return nil, code.ErrorBackupImportFileEmpty.WithDetails(err.Error())
-		}
-		if info.Size() > s.importLimitBytes {
-			return nil, code.ErrorBackupImportFileTooLarge.
-				WithDetails(fmt.Sprintf("%d > %d bytes", info.Size(), s.importLimitBytes))
+	// 从应用设置实时解析，系统设置修改后立即生效。
+	if s.appSettings != nil {
+		if limitEnabled, limitBytes := s.appSettings.BackupImportSizeLimitResolved(); limitEnabled {
+			info, err := os.Stat(zipPath)
+			if err != nil {
+				return nil, code.ErrorBackupImportFileEmpty.WithDetails(err.Error())
+			}
+			if info.Size() > limitBytes {
+				return nil, code.ErrorBackupImportFileTooLarge.
+					WithDetails(fmt.Sprintf("%d > %d bytes", info.Size(), limitBytes))
+			}
 		}
 	}
 

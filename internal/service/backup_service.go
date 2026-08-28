@@ -79,9 +79,8 @@ type backupService struct {
 	pendingSyncs   sync.Map                     // key: uid (int64), value: bool
 	runningTasks   map[int64]context.CancelFunc // key: configID
 	runningMu      sync.Mutex
-	importTasks      sync.Map // taskID -> *backupImportTask
-	importLimitOn    bool
-	importLimitBytes int64
+	importTasks   sync.Map                // taskID -> *backupImportTask
+	appSettings   *config.AppSettings     // live app settings; size limit resolved per submission
 }
 
 // NewBackupService creates BackupService instance
@@ -98,8 +97,7 @@ func NewBackupService(
 	storageConfig *config.StorageConfig,
 	tempPath string,
 	logger *zap.Logger,
-	importLimitEnabled bool,
-	importLimitBytes int64,
+	appSettings *config.AppSettings,
 ) BackupService {
 	if tempPath == "" {
 		tempPath = "storage/temp"
@@ -121,8 +119,7 @@ func NewBackupService(
 		runningTasks:    make(map[int64]context.CancelFunc),
 		ctx:             ctx,
 		cancel:          cancel,
-		importLimitOn:   importLimitEnabled,
-		importLimitBytes: importLimitBytes,
+		appSettings:     appSettings,
 	}
 
 	// Startup sweep: reclaim orphaned backup staging files left behind by a

@@ -63,6 +63,8 @@ type AdminConfig struct {
 	PipelineWindowDown            *int               `json:"pipelineWindowDown,omitempty" form:"pipelineWindowDown"`                       // Download pipeline window size for pv>=2 connections; 0 = stop-and-wait // pv>=2 连接的下行流水线窗口大小；0 = stop-and-wait
 	GitName                       *string            `json:"gitName,omitempty" form:"gitName"`                                             // Git author name // Git 提交的作者名称
 	GitEmail                      *string            `json:"gitEmail,omitempty" form:"gitEmail"`                                           // Git author email // Git 提交的作者邮箱
+	BackupImportSizeLimitEnabled  *bool              `json:"backupImportSizeLimitEnabled,omitempty" form:"backupImportSizeLimitEnabled"`   // Whether the backup import size limit is enforced // 是否启用备份导入大小限制
+	BackupImportSizeLimit         *string            `json:"backupImportSizeLimit,omitempty" form:"backupImportSizeLimit"`                 // Max backup import archive size, e.g. "2GB" // 备份导入压缩包大小上限，如 "2GB"
 }
 
 // AdminUserDatabaseConfig User database configuration structure

@@ -68,8 +68,12 @@ func initServices(cfg *AppConfig, infra *Infra, repos *Repositories, logger *zap
 		logger,
 	)
 	s.StorageService = service.NewStorageService(repos.StorageRepo, &cfg.Storage)
-	importLimitEnabled, importLimitBytes := cfg.GetBackupImportSizeLimit()
-	s.BackupService = service.NewBackupService(repos.BackupRepo, repos.NoteRepo, repos.FolderRepo, repos.FileRepo, repos.VaultRepo, repos.SettingRepo, repos.NoteHistoryRepo, s.StorageService, &cfg.Storage, cfg.App.TempPath, logger, importLimitEnabled, importLimitBytes)
+	// Pass a live handle to AppSettings (not a snapshot): the backup import size limit is
+	// resolved per submission via appSettings.BackupImportSizeLimitResolved(), so changes
+	// made in system settings take effect immediately without restart.
+	// 传入 AppSettings 实时句柄（非构造期快照）：备份导入大小限制在每次提交时经
+	// appSettings.BackupImportSizeLimitResolved() 解析，系统设置修改后立即生效、无需重启。
+	s.BackupService = service.NewBackupService(repos.BackupRepo, repos.NoteRepo, repos.FolderRepo, repos.FileRepo, repos.VaultRepo, repos.SettingRepo, repos.NoteHistoryRepo, s.StorageService, &cfg.Storage, cfg.App.TempPath, logger, &cfg.App)
 	s.GitSyncService = service.NewGitSyncService(repos.GitSyncRepo, repos.NoteRepo, repos.FolderRepo, repos.FileRepo, repos.VaultRepo, repos.SettingRepo, &cfg.Git, logger)
 
 	// Initialize SyncLogService first, as NoteService/FileService/SettingService depend on it

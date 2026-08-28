@@ -172,6 +172,8 @@ func (h *AdminControlHandler) GetConfig(c *gin.Context) {
 		GitEmail:                      &cfg.Git.Email,
 		PipelineWindowUp:              cfg.App.PipelineWindowUp,
 		PipelineWindowDown:            cfg.App.PipelineWindowDown,
+		BackupImportSizeLimitEnabled:  cfg.App.BackupImportSizeLimitEnabled,
+		BackupImportSizeLimit:         &cfg.App.BackupImportSizeLimit,
 	}
 
 	response.ToResponse(code.Success.WithData(data))
@@ -290,6 +292,29 @@ func (h *AdminControlHandler) UpdateConfig(c *gin.Context) {
 			logger.Warn("apiRouter.WebGUI.UpdateConfig invalid writeQueueIdleTime format",
 				zap.String("value", *params.WriteQueueIdleTime))
 			response.ToResponse(code.ErrorInvalidParams.WithDetails("writeQueueIdleTime format invalid, e.g. 10m, 1h"))
+			return
+		}
+	}
+
+	// Validate backupImportSizeLimit (live, only when a non-empty value is provided).
+	// 校验 backupImportSizeLimit（非空时才校验）：
+	// - must parse to a positive byte count via util.ParseSize (pass -1 as the default so
+	//   an unparseable value surfaces as <= 0);
+	//   - 必须能被 util.ParseSize 解析为 > 0 的字节数（默认值传 -1，解析失败时返回 -1）；
+	// - recommended lower bound 1MB: smaller limits would reject normal backup packages.
+	//   - 建议下限 1MB：过小会导致正常备份包无法导入。
+	if params.BackupImportSizeLimit != nil && *params.BackupImportSizeLimit != "" {
+		size := util.ParseSize(*params.BackupImportSizeLimit, -1)
+		if size <= 0 {
+			logger.Warn("apiRouter.WebGUI.UpdateConfig invalid backupImportSizeLimit format",
+				zap.String("value", *params.BackupImportSizeLimit))
+			response.ToResponse(code.ErrorInvalidParams.WithDetails("backupImportSizeLimit format invalid, e.g. 512MB, 1GB, 2GB"))
+			return
+		}
+		if size < 1*1024*1024 {
+			logger.Warn("apiRouter.WebGUI.UpdateConfig backupImportSizeLimit too small",
+				zap.String("value", *params.BackupImportSizeLimit))
+			response.ToResponse(code.ErrorInvalidParams.WithDetails("backupImportSizeLimit must be at least 1MB"))
 			return
 		}
 	}
@@ -432,6 +457,12 @@ func (h *AdminControlHandler) UpdateConfig(c *gin.Context) {
 	}
 	if params.PipelineWindowDown != nil {
 		cfg.App.PipelineWindowDown = params.PipelineWindowDown
+	}
+	if params.BackupImportSizeLimitEnabled != nil {
+		cfg.App.BackupImportSizeLimitEnabled = params.BackupImportSizeLimitEnabled
+	}
+	if params.BackupImportSizeLimit != nil {
+		cfg.App.BackupImportSizeLimit = *params.BackupImportSizeLimit
 	}
 
 	// Save configuration to file

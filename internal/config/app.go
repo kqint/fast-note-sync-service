@@ -1,5 +1,13 @@
 package config
 
+import "github.com/haierkeys/fast-note-sync-service/pkg/util"
+
+// DefaultBackupImportSizeLimitBytes is the fallback backup import size limit (2GB)
+// applied when the configured size string is missing or invalid.
+// DefaultBackupImportSizeLimitBytes 备份导入大小限制的兜底值（2GB），
+// 配置缺失或非法时生效。
+const DefaultBackupImportSizeLimitBytes = 2 * 1024 * 1024 * 1024
+
 // AppSettings application settings
 // AppSettings 应用设置
 type AppSettings struct {
@@ -31,11 +39,14 @@ type AppSettings struct {
 	// HistorySaveDelay historical record save delay time, supports format: 10s (seconds), 1m (minutes), default 10s
 	// HistorySaveDelay历史记录保存延迟时间，支持格式：10s（秒）、1m（分钟），默认 10s
 	HistorySaveDelay string `yaml:"history-save-delay" default:"10s"`
-	// BackupImportSizeLimitEnabled toggles the backup import archive size limit; default true.
-	// 备份导入文件大小限制开关，默认开启。
-	BackupImportSizeLimitEnabled *bool `yaml:"backup-import-size-limit-enabled" default:"true"`
+	// BackupImportSizeLimitEnabled toggles the backup import archive size limit; default false
+	// (unlimited). Modifiable at runtime via system settings (POST /api/admin/config).
+	// 备份导入文件大小限制开关，默认关闭（不限制）。
+	// 可在系统设置中修改（POST /api/admin/config），修改后热生效。
+	BackupImportSizeLimitEnabled *bool `yaml:"backup-import-size-limit-enabled" default:"false"`
 	// BackupImportSizeLimit max backup import archive size, e.g. "512MB", "2GB"; default 2GB.
-	// 备份导入文件大小上限，支持 "512MB"、"2GB" 等格式，默认 2GB。
+	// Only takes effect when BackupImportSizeLimitEnabled is true.
+	// 备份导入文件大小上限，支持 "512MB"、"2GB" 等格式，默认 2GB。仅在开关开启时生效。
 	BackupImportSizeLimit string `yaml:"backup-import-size-limit" default:"2GB"`
 	// UploadSessionTimeout file upload session timeout duration
 	// UploadSessionTimeout 文件上传会话超时时间
@@ -122,6 +133,21 @@ func clampWindow(v, max int) int {
 		return max
 	}
 	return v
+}
+
+// BackupImportSizeLimitResolved resolves the backup import size limit live from
+// the settings. Returns (enabled, limitBytes); disabled by default, and when
+// enabled a missing/invalid size falls back to DefaultBackupImportSizeLimitBytes.
+// Reading live (not a constructor snapshot) lets system-settings changes take
+// effect immediately for the next import submission.
+// BackupImportSizeLimitResolved 从设置实时解析备份导入大小限制，返回 (是否启用, 上限字节数)。
+// 默认关闭；启用时缺失/非法配置回退 DefaultBackupImportSizeLimitBytes。
+// 实时读取（非构造期快照）使系统设置的修改对下一次导入提交立即生效。
+func (a AppSettings) BackupImportSizeLimitResolved() (bool, int64) {
+	if a.BackupImportSizeLimitEnabled == nil || !*a.BackupImportSizeLimitEnabled {
+		return false, 0
+	}
+	return true, util.ParseSize(a.BackupImportSizeLimit, DefaultBackupImportSizeLimitBytes)
 }
 
 // PipelineWindowUpClamped returns PipelineWindowUp clamped to [0,32]. A nil pointer (config
