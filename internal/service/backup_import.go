@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/haierkeys/fast-note-sync-service/internal/domain"
@@ -21,28 +22,99 @@ import (
 	"gorm.io/gorm"
 )
 
-// ImportBackup imports a backup archive into the target vault.
-// Zero-trust validation: the archive must contain fns-backup.manifest.json, and
-// every requested section must actually be present; otherwise the caller may
-// retry with AllowPartial to import only the available sections.
-// Current strategy: full overwrite — existing items with the same path are
-// replaced by archive content, missing items are created; unrelated current
-// data is left untouched. Note history is restored per note: existing versions
-// of notes present in the archive are cleared before inserting archived ones.
-//
-// Vault sync (WebSocket) is paused for the target vault during the import to
-// prevent concurrent multi-device writes from interleaving with imported data.
-//
-// 导入备份包到目标仓库。
-// 零信任校验：备份包必须包含 fns-backup.manifest.json，且所有勾选的部分必须真实存在；
-// 否则调用方可携带 AllowPartial 重试，仅导入实际存在的部分。
-// 当前策略：全部覆盖 —— 同名路径的现有数据被备份包内容替换，缺失的条目被创建；
-// 与备份无关的现有数据保持不变。笔记历史按笔记恢复：先清除存在于备份包中的
-// 笔记的现有历史版本，再写入归档的历史版本。
-//
-// 导入期间会暂停目标仓库的 WebSocket 同步，防止多端并发写入与导入数据交叉。
-func (s *backupService) ImportBackup(ctx context.Context, uid int64, req *dto.BackupImportRequest, zipPath string) (*dto.BackupImportResultDTO, error) {
-	defer os.Remove(zipPath)
+// Import task phases.
+// 导入任务阶段。
+const (
+	importPhaseValidating   = "validating"
+	importPhaseAwaitPartial = "await_partial"
+	importPhaseImporting    = "importing"
+	importPhaseSuccess      = "success"
+	importPhaseFailed       = "failed"
+	importPhaseCancelled    = "cancelled"
+)
+
+const (
+	// backupImportTaskRetention how long finished tasks stay memory for polling.
+	// backupImportTaskRetention 已完成任务在内存中保留供轮询的时长。
+	backupImportTaskRetention = time.Hour
+	// backupImportFIDPagination page size for FID/history listing batches.
+	// backupImportFIDPagination 分页遍历时的每页大小。
+	backupImportFIDPagination = 1000
+	// backupImportProgressLogInterval log an info line every N imported items.
+	// backupImportProgressLogInterval 每导入 N 条输出一次进度日志。
+	backupImportProgressLogInterval = 200
+)
+
+// backupImportAwaitPartialTimeout is the time a task waits in await_partial for
+// the user's confirm before cancelling itself (var so tests can shorten it).
+// backupImportAwaitPartialTimeout await_partial 等待确认的超时时间（变量便于测试缩短）。
+var backupImportAwaitPartialTimeout = 15 * time.Minute
+
+// backupImportTask is the in-memory state of one async import task.
+// backupImportTask 单个异步导入任务的内存状态。
+type backupImportTask struct {
+	taskID    string
+	uid       int64
+	mu        sync.Mutex
+	phase     string
+	zipPath   string
+	workDir   string
+	req       dto.BackupImportRequest
+	available dto.BackupImportAvailabilityDTO
+	missing   []string
+	totals    dto.BackupImportTotalsDTO
+	progress  dto.BackupImportProgressDTO
+	result    *dto.BackupImportResultDTO
+	errCode   int
+	errMsg    string
+	finishedAt time.Time
+	confirmCh chan bool
+}
+
+func (t *backupImportTask) snapshot() *dto.BackupImportTaskStatusDTO {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return &dto.BackupImportTaskStatusDTO{
+		TaskID:    t.taskID,
+		Phase:     t.phase,
+		Totals:    t.totals,
+		Progress:  t.progress,
+		Available: copyAvailability(t.available),
+		Missing:   append([]string(nil), t.missing...),
+		Result:    t.result,
+		Error:     t.errorDTO(),
+	}
+}
+
+func (t *backupImportTask) errorDTO() *dto.BackupImportTaskErrorDTO {
+	if t.errCode == 0 {
+		return nil
+	}
+	return &dto.BackupImportTaskErrorDTO{Code: t.errCode, Message: t.errMsg}
+}
+
+func copyAvailability(a dto.BackupImportAvailabilityDTO) *dto.BackupImportAvailabilityDTO {
+	// Keep nil for zero struct so JSON omits before phase fills it
+	// 零值时保持 nil，保证 JSON 在该阶段前省略该字段
+	if !a.Notes && !a.VaultConfig && !a.NoteHistory {
+		return nil
+	}
+	c := a
+	return &c
+}
+
+// SubmitImportBackup validates the upload and starts the async import.
+// 校验上传文件并启动异步导入任务。
+func (s *backupService) SubmitImportBackup(ctx context.Context, uid int64, req *dto.BackupImportRequest, zipPath string) (*dto.BackupImportTaskDTO, error) {
+	// Remove the upload on every early-error path; once the task owns it, the
+	// goroutine performs removal when it finishes.
+	// 所有错误路径清理上传文件；任务接管后由 goroutine 在结束时删除。
+	owned := false
+	defer func() {
+		if !owned && zipPath != "" {
+			_ = os.Remove(zipPath)
+		}
+	}()
 
 	if zipPath == "" {
 		return nil, code.ErrorBackupImportFileEmpty
@@ -57,6 +129,22 @@ func (s *backupService) ImportBackup(ctx context.Context, uid int64, req *dto.Ba
 		return nil, code.ErrorBackupImportOptionInvalid
 	}
 
+	// Authoritative size check (layer 3; handler already checked Content-Length
+	// and multipart header earlier).
+	// 权威大小校验（第三层；handler 已在前两处检查 Content-Length 与 multipart 头）。
+	if s.importLimitOn {
+		info, err := os.Stat(zipPath)
+		if err != nil {
+			return nil, code.ErrorBackupImportFileEmpty.WithDetails(err.Error())
+		}
+		if info.Size() > s.importLimitBytes {
+			return nil, code.ErrorBackupImportFileTooLarge.
+				WithDetails(fmt.Sprintf("%d > %d bytes", info.Size(), s.importLimitBytes))
+		}
+	}
+
+	// Early vault existence check for fast feedback.
+	// 预先校验仓库存在，快速反馈。
 	vault, err := s.vaultRepo.GetByName(ctx, req.Vault, uid)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -68,40 +156,163 @@ func (s *backupService) ImportBackup(ctx context.Context, uid int64, req *dto.Ba
 		return nil, code.ErrorVaultNotFound
 	}
 
-	// Stage the extraction under the app temp path so it can be swept on startup
-	// 将解压目录置于应用临时路径下，便于启动时清理
-	if err := os.MkdirAll(s.backupStagingDir(), 0o755); err != nil {
-		return nil, err
+	taskID := util.GetRandomString(16)
+	task := &backupImportTask{
+		taskID:    taskID,
+		uid:       uid,
+		phase:     importPhaseValidating,
+		zipPath:   zipPath,
+		req:       *req,
+		confirmCh: make(chan bool, 1),
 	}
-	workDir, err := os.MkdirTemp(s.backupStagingDir(), fmt.Sprintf("import_%d_", uid))
+	s.importTasks.Store(taskID, task)
+	owned = true
+	s.sweepFinishedImportTasksLocked()
+
+	s.wg.Add(1)
+	go s.runImportTask(task)
+
+	return &dto.BackupImportTaskDTO{TaskID: taskID, Phase: importPhaseValidating}, nil
+}
+
+// GetImportTaskStatus returns the status snapshot of a uid-owned task.
+// 返回当前用户导入任务的状态快照。
+func (s *backupService) GetImportTaskStatus(ctx context.Context, uid int64, taskID string) (*dto.BackupImportTaskStatusDTO, error) {
+	task, err := s.loadImportTask(uid, taskID)
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(workDir)
+	return task.snapshot(), nil
+}
 
-	extractDir := filepath.Join(workDir, "extract")
-	if err := util.UnzipWithPassword(zipPath, extractDir, req.Password); err != nil {
-		s.logger.Warn("Failed to unzip backup import file",
-			zap.Int64("uid", uid),
-			zap.String("vault", vault.Name),
-			zap.Error(err))
-		return nil, code.ErrorBackupImportZipFailed.WithDetails(err.Error())
+// ConfirmImportTask confirms or cancels an await_partial import task.
+// 确认或取消处于 await_partial 的导入任务。
+func (s *backupService) ConfirmImportTask(ctx context.Context, uid int64, taskID string, allowPartial bool) (*dto.BackupImportTaskStatusDTO, error) {
+	task, err := s.loadImportTask(uid, taskID)
+	if err != nil {
+		return nil, err
+	}
+	task.mu.Lock()
+	phase := task.phase
+	task.mu.Unlock()
+	if phase != importPhaseAwaitPartial {
+		return task.snapshot(), code.ErrorBackupImportTaskNotFound
 	}
 
-	// Zero trust: verify which sections actually exist in the archive. The
-	// archive holds no manifest, so availability is derived by scanning files.
-	// 零信任：校验备份包中实际存在的部分。归档内无清单文件，
-	// 可用性通过直接扫描归档内的文件确定。
+	select {
+	case task.confirmCh <- allowPartial:
+	default:
+		return task.snapshot(), code.ErrorBackupImportTaskNotFound
+	}
+	return task.snapshot(), nil
+}
+
+// loadImportTask resolves task by id, enforcing uid ownership, retention and
+// unknown-task semantics (549).
+// 按 ID 解析任务，校验 uid 归属、保留期与未知任务语义（549）。
+func (s *backupService) loadImportTask(uid int64, taskID string) (*backupImportTask, error) {
+	v, ok := s.importTasks.Load(taskID)
+	if !ok {
+		return nil, code.ErrorBackupImportTaskNotFound
+	}
+	task := v.(*backupImportTask)
+	if task.uid != uid {
+		return nil, code.ErrorBackupImportTaskNotFound
+	}
+
+	task.mu.Lock()
+	defer task.mu.Unlock()
+	if !task.finishedAt.IsZero() && time.Since(task.finishedAt) > backupImportTaskRetention {
+		// Expired finished task: drop it and report as missing.
+		// 超期完成态任务：移除并视为不存在。
+		s.importTasks.Delete(taskID)
+		return nil, code.ErrorBackupImportTaskNotFound
+	}
+	return task, nil
+}
+
+// sweepFinishedImportTasksLocked opportunistically removes expired tasks.
+// 惰性清理已过期任务。
+func (s *backupService) sweepFinishedImportTasksLocked() {
+	now := time.Now()
+	s.importTasks.Range(func(key, value any) bool {
+		task := value.(*backupImportTask)
+		task.mu.Lock()
+		expired := !task.finishedAt.IsZero() && now.Sub(task.finishedAt) > backupImportTaskRetention
+		task.mu.Unlock()
+		if expired {
+			s.importTasks.Delete(key)
+		}
+		return true
+	})
+}
+
+// runImportTask is the background execution of one import task.
+// 后台执行单个导入任务。
+func (s *backupService) runImportTask(task *backupImportTask) {
+	defer s.wg.Done()
+
+	// Any outcome removes staged files; the task entry itself stays in memory
+	// for retention polling.
+	// 任何终态都清理暂存文件；任务条目保留在内存中供轮询。
+	defer func() {
+		_ = os.Remove(task.zipPath)
+		if task.workDir != "" {
+			_ = os.RemoveAll(task.workDir)
+		}
+	}()
+
+	if err := s.runImportTaskInner(task); err != nil {
+		codeErr, ok := err.(*code.Code)
+		if !ok {
+			codeErr = code.ErrorServerInternal.WithDetails(err.Error())
+		}
+		s.finishImportTask(task, codeErr.Code(), codeErr.Error())
+	}
+}
+
+// runImportTaskInner performs the phases before success; returns nil on success.
+// 执行各阶段，成功返回 nil。
+func (s *backupService) runImportTaskInner(task *backupImportTask) error {
+	uid := task.uid
+	req := &task.req
+	ctx := s.ctx
+
+	// ---- validating: unzip + scan ----
+	// ---- 校验阶段：解压 + 零信任扫描 ----
+	if err := os.MkdirAll(s.backupStagingDir(), 0o755); err != nil {
+		return err
+	}
+	workDir, err := os.MkdirTemp(s.backupStagingDir(), fmt.Sprintf("import_%d_", uid))
+	if err != nil {
+		return err
+	}
+	task.workDir = workDir
+	extractDir := filepath.Join(workDir, "extract")
+
+	if err := util.UnzipWithPassword(task.zipPath, extractDir, req.Password); err != nil {
+		s.logger.Warn("Failed to unzip backup import file",
+			zap.Int64("uid", uid), zap.String("taskId", task.taskID), zap.Error(err))
+		return code.ErrorBackupImportZipFailed.WithDetails(err.Error())
+	}
+
 	notePaths, filePaths, settingPaths := classifyArchiveFiles(extractDir)
+	historyCount := countBackupHistoryEntries(extractDir)
 	available := dto.BackupImportAvailabilityDTO{
 		Notes:       len(notePaths)+len(filePaths) > 0,
 		VaultConfig: len(settingPaths) > 0,
-		NoteHistory: countBackupHistoryEntries(extractDir) > 0,
+		NoteHistory: historyCount > 0,
 	}
+	task.mu.Lock()
+	task.available = available
+	task.totals = dto.BackupImportTotalsDTO{
+		Notes:       int64(len(notePaths)),
+		Files:       int64(len(filePaths)),
+		Settings:    int64(len(settingPaths)),
+		NoteHistory: int64(historyCount),
+	}
+	task.mu.Unlock()
 
-	// Zero trust: verify that every requested section actually exists in the
-	// archive. On mismatch the client decides whether to import partially.
-	// 零信任：校验勾选的部分在备份包中真实存在。缺失时由客户端决定是否部分导入。
 	var missing []string
 	if req.IncludeNotes && !available.Notes {
 		missing = append(missing, "notes")
@@ -112,64 +323,107 @@ func (s *backupService) ImportBackup(ctx context.Context, uid int64, req *dto.Ba
 	if req.IncludeNoteHistory && !available.NoteHistory {
 		missing = append(missing, "noteHistory")
 	}
+
+	// ---- await_partial: wait for the user's confirmation ----
+	// ---- 等待用户对部分导入的确认 ----
 	if len(missing) > 0 && !req.AllowPartial {
-		return nil, code.ErrorBackupImportSectionMissing.
-			WithData(dto.BackupImportValidateDTO{
-				Available: available,
-				Missing:   missing,
-			})
-	}
-	// Partial import: restrict the request to sections that really exist;
-	// if nothing remains to import, treat it as an empty archive.
-	// 部分导入：将请求限定为实际存在的部分；若没有任何可导入内容则视为空备份包。
-	if !available.Notes && !available.VaultConfig && !available.NoteHistory {
-		return nil, code.ErrorBackupImportInvalidArchive.WithDetails("archive contains no importable content")
-	}
-	req.IncludeNotes = req.IncludeNotes && available.Notes
-	req.IncludeVaultConfig = req.IncludeVaultConfig && available.VaultConfig
-	req.IncludeNoteHistory = req.IncludeNoteHistory && available.NoteHistory
-	if !req.IncludeNotes && !req.IncludeVaultConfig && !req.IncludeNoteHistory {
-		return nil, code.ErrorBackupImportOptionInvalid
+		task.mu.Lock()
+		task.missing = missing
+		task.phase = importPhaseAwaitPartial
+		task.mu.Unlock()
+
+		select {
+		case v := <-task.confirmCh:
+			if !v {
+				task.mu.Lock()
+				task.phase = importPhaseCancelled
+				task.finishedAt = time.Now()
+				task.mu.Unlock()
+				return nil
+			}
+		case <-time.After(backupImportAwaitPartialTimeout):
+			task.mu.Lock()
+			task.phase = importPhaseCancelled
+			task.finishedAt = time.Now()
+			task.mu.Unlock()
+			return nil
+		case <-ctx.Done():
+			task.mu.Lock()
+			task.phase = importPhaseCancelled
+			task.finishedAt = time.Now()
+			task.mu.Unlock()
+			return nil
+		}
+
+		if !available.Notes && !available.VaultConfig && !available.NoteHistory {
+			return code.ErrorBackupImportInvalidArchive.WithDetails("archive contains no importable content")
+		}
+		req.IncludeNotes = req.IncludeNotes && available.Notes
+		req.IncludeVaultConfig = req.IncludeVaultConfig && available.VaultConfig
+		req.IncludeNoteHistory = req.IncludeNoteHistory && available.NoteHistory
+		if !req.IncludeNotes && !req.IncludeVaultConfig && !req.IncludeNoteHistory {
+			return code.ErrorBackupImportOptionInvalid
+		}
+	} else {
+		// No missing sections or partial allowed up front: nothing to shrink.
+		// If archive has no content at all, reject early.
+		if !available.Notes && !available.VaultConfig && !available.NoteHistory {
+			return code.ErrorBackupImportInvalidArchive.WithDetails("archive contains no importable content")
+		}
 	}
 
-	result := &dto.BackupImportResultDTO{Vault: vault.Name}
+	// ---- importing ----
+	// ---- 导入阶段 ----
+	vault, err := s.vaultRepo.GetByName(ctx, req.Vault, uid)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return code.ErrorVaultNotFound
+		}
+		return err
+	}
+	if vault == nil {
+		return code.ErrorVaultNotFound
+	}
 
-	// Pause sync for the target vault while importing so concurrent multi-device
-	// traffic cannot interleave with imported writes.
-	// 导入期间暂停目标仓库同步，防止多端并发流量与导入写入交叉。
+	task.mu.Lock()
+	task.phase = importPhaseImporting
+	task.mu.Unlock()
+
+	// Pause sync for the target vault while importing; resume on exit.
+	// 导入期间暂停目标仓库同步，退出时恢复。
 	syncgate.Pause(uid, vault.Name)
 	defer syncgate.Resume(uid, vault.Name)
 
-	// 1. Notes & attachments (option 1)
-	// 1. 笔记和附件 (选项 1)
+	result := &dto.BackupImportResultDTO{Vault: vault.Name}
+
 	if req.IncludeNotes {
-		result.Notes, result.Files, err = s.importNotesAndAttachments(ctx, uid, vault.ID, extractDir, notePaths, filePaths)
+		result.Notes, result.Files, err = s.importNotesAndAttachments(ctx, uid, vault.ID, extractDir, notePaths, filePaths, task)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
-
-	// 2. Vault config (.obsidian) (option 2)
-	// 2. 仓库配置 (.obsidian) (选项 2)
 	if req.IncludeVaultConfig {
-		result.Settings, err = s.importVaultSettings(ctx, uid, vault.ID, extractDir, settingPaths)
+		result.Settings, err = s.importVaultSettings(ctx, uid, vault.ID, extractDir, settingPaths, task)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
-
-	// 3. Note history (option 3, depends on option 1)
-	// 3. 笔记历史 (选项 3，依赖选项 1)
 	if req.IncludeNoteHistory {
-		result.NoteHistory, result.SkippedHistory, err = s.importNoteHistory(ctx, uid, vault.ID, extractDir)
+		result.NoteHistory, result.SkippedHistory, err = s.importNoteHistory(ctx, uid, vault.ID, extractDir, task)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
-	s.logger.Info("Backup import completed",
+	task.mu.Lock()
+	task.result = result
+	task.phase = importPhaseSuccess
+	task.finishedAt = time.Now()
+	task.mu.Unlock()
+
+	s.logger.Info("Backup import task completed",
 		zap.Int64("uid", uid),
-		zap.String("vault", vault.Name),
+		zap.String("taskId", task.taskID),
 		zap.Bool("includeNotes", req.IncludeNotes),
 		zap.Bool("includeVaultConfig", req.IncludeVaultConfig),
 		zap.Bool("includeNoteHistory", req.IncludeNoteHistory),
@@ -180,30 +434,136 @@ func (s *backupService) ImportBackup(ctx context.Context, uid int64, req *dto.Ba
 		zap.Int64("skippedHistory", result.SkippedHistory),
 	)
 
-	// Trigger debounced sync/backup tasks so external mirrors pick up imported data
-	// 触发防抖的同步/备份任务，让外部镜像获取导入的数据
+	// Trigger debounced sync/backup tasks so external mirrors pick up imported data.
+	// 触发防抖同步/备份任务。
 	s.NotifyUpdated(uid)
+	return nil
+}
 
-	return result, nil
+// finishImportTask records a terminal failed/cancelled phase.
+// 记录失败终态。
+func (s *backupService) finishImportTask(task *backupImportTask, errCode int, errMsg string) {
+	task.mu.Lock()
+	defer task.mu.Unlock()
+	if task.phase != importPhaseFailed {
+		task.errCode = errCode
+		task.errMsg = errMsg
+		task.phase = importPhaseFailed
+		task.finishedAt = time.Now()
+	}
+	s.logger.Warn("Backup import task failed",
+		zap.Int64("uid", task.uid),
+		zap.String("taskId", task.taskID),
+		zap.Int("code", errCode),
+		zap.String("message", errMsg))
+}
+
+// importProgress tracks task progress across the import subroutines.
+// 跟踪任务处理进度的辅助结构。
+type importProgress struct {
+	service *backupService
+	task    *backupImportTask
+}
+
+func (p *importProgress) add(notes, files, settings, history, skipped int64) {
+	task := p.task
+	task.mu.Lock()
+	task.progress.Notes += notes
+	task.progress.Files += files
+	task.progress.Settings += settings
+	task.progress.NoteHistory += history
+	task.progress.SkippedHistory += skipped
+	total := task.progress.Notes + task.progress.Files + task.progress.Settings + task.progress.NoteHistory
+	shouldLog := total > 0 && total%backupImportProgressLogInterval == 0
+	task.mu.Unlock()
+	if shouldLog {
+		p.service.logger.Info("Backup import progress",
+			zap.Int64("uid", task.uid),
+			zap.String("taskId", task.taskID),
+			zap.Int64("done", total))
+	}
 }
 
 // Note: archives carry no manifest, and import validation derives section
 // availability by scanning the extracted files directly (classifyArchiveFiles).
 // 说明：归档不携带清单文件，导入端通过直接扫描解压文件确定各部分可用性（见 classifyArchiveFiles）。
 
-// countBackupHistoryEntries counts entries in the archived note history data file
-// (.fns/note_history.json).
-// 统计备份包中笔记历史数据文件 (.fns/note_history.json) 的条目数。
+// countBackupHistoryEntries streams the archived note history data file
+// (.fns/note_history.json) once to count entries without loading full payloads.
+// 流式统计备份包中笔记历史数据文件 (.fns/note_history.json) 的条目数，
+// 避免一次性载入全部内容。
 func countBackupHistoryEntries(extractDir string) int {
-	data, err := os.ReadFile(filepath.Join(extractDir, filepath.FromSlash(BackupNoteHistoryFileName)))
+	count, err := streamBackupHistory(extractDir, nil)
 	if err != nil {
 		return 0
 	}
-	var entries []BackupNoteHistoryEntry
-	if json.Unmarshal(data, &entries) != nil {
-		return 0
+	return count
+}
+
+// streamBackupHistory decodes the archived history json with a streaming
+// decoder: first pass counts entries, second pass (only when fn is set)
+// invokes fn per entry for insertion, keeping memory flat.
+// 流式两遍解析历史 JSON：第一遍计数；fn 非空时第二遍逐条回调插入，保持内存平稳。
+func streamBackupHistory(extractDir string, fn func(*BackupNoteHistoryEntry) error) (int, error) {
+	path := filepath.Join(extractDir, filepath.FromSlash(BackupNoteHistoryFileName))
+	open := func() (*os.File, error) {
+		f, err := os.Open(path)
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return f, err
 	}
-	return len(entries)
+
+	count := 0
+	first, err := open()
+	if err != nil {
+		return 0, err
+	}
+	if first == nil {
+		return 0, nil
+	}
+	dec := json.NewDecoder(first)
+	if _, err := dec.Token(); err != nil {
+		first.Close()
+		return 0, err
+	}
+	for dec.More() {
+		var e BackupNoteHistoryEntry
+		if err := dec.Decode(&e); err != nil {
+			first.Close()
+			return count, err
+		}
+		count++
+	}
+	first.Close()
+
+	if fn != nil {
+		second, err := open()
+		if err != nil {
+			return count, err
+		}
+		if second == nil {
+			return count, nil
+		}
+		dec2 := json.NewDecoder(second)
+		if _, err := dec2.Token(); err != nil {
+			second.Close()
+			return count, err
+		}
+		for dec2.More() {
+			var e BackupNoteHistoryEntry
+			if err := dec2.Decode(&e); err != nil {
+				second.Close()
+				return count, err
+			}
+			if err := fn(&e); err != nil {
+				second.Close()
+				return count, err
+			}
+		}
+		second.Close()
+	}
+	return count, nil
 }
 
 // classifyArchiveFiles splits extracted files into notes (*.md), attachments and
@@ -241,9 +601,10 @@ func classifyArchiveFiles(extractDir string) (notes, files []string, settings []
 // importNotesAndAttachments upserts notes (*.md) and attachments with an
 // overwrite strategy, then rebuilds folder FIDs and vault statistics.
 // 以覆盖策略更新或创建笔记 (*.md) 与附件，随后重建文件夹 FID 与仓库统计。
-func (s *backupService) importNotesAndAttachments(ctx context.Context, uid, vaultID int64, extractDir string, notePaths, filePaths []string) (int64, int64, error) {
+func (s *backupService) importNotesAndAttachments(ctx context.Context, uid, vaultID int64, extractDir string, notePaths, filePaths []string, task *backupImportTask) (int64, int64, error) {
 	nowMs := timex.Now().UnixMilli()
 	var importedNotes, importedFiles int64
+	progress := &importProgress{service: s, task: task}
 
 	for _, relPath := range notePaths {
 		if ctx.Err() != nil {
@@ -299,6 +660,7 @@ func (s *backupService) importNotesAndAttachments(ctx context.Context, uid, vaul
 			return importedNotes, importedFiles, code.ErrorDBQuery.WithDetails(getErr.Error())
 		}
 		importedNotes++
+		progress.add(1, 0, 0, 0, 0)
 	}
 
 	// Mirror the DAO content-folder scheme (storage/vault/u_{uid}/file) so the
@@ -375,6 +737,7 @@ func (s *backupService) importNotesAndAttachments(ctx context.Context, uid, vaul
 			return importedNotes, importedFiles, code.ErrorDBQuery.WithDetails(getErr.Error())
 		}
 		importedFiles++
+		progress.add(0, 1, 0, 0, 0)
 	}
 
 	// Rebuild folder records/FIDs for imported resources
@@ -433,9 +796,10 @@ func stageAttachmentFile(fileStorageDir, srcPath string) (string, error) {
 
 // importVaultSettings upserts .obsidian config records with an overwrite strategy.
 // 以覆盖策略更新或创建 .obsidian 配置记录。
-func (s *backupService) importVaultSettings(ctx context.Context, uid, vaultID int64, extractDir string, settingPaths []string) (int64, error) {
+func (s *backupService) importVaultSettings(ctx context.Context, uid, vaultID int64, extractDir string, settingPaths []string, task *backupImportTask) (int64, error) {
 	nowMs := timex.Now().UnixMilli()
 	var count int64
+	progress := &importProgress{service: s, task: task}
 
 	for _, relPath := range settingPaths {
 		if ctx.Err() != nil {
@@ -490,6 +854,7 @@ func (s *backupService) importVaultSettings(ctx context.Context, uid, vaultID in
 			return count, code.ErrorDBQuery.WithDetails(getErr.Error())
 		}
 		count++
+		progress.add(0, 0, 1, 0, 0)
 	}
 	return count, nil
 }
@@ -498,12 +863,14 @@ func (s *backupService) importVaultSettings(ctx context.Context, uid, vaultID in
 // has entries in the archive, its current history versions are removed first
 // (overwrite strategy), then archived entries are re-created with original
 // metadata; sidecar content/patch files are written by the repository layer.
+// Note paths are resolved against existing notes after the notes import phase.
 //
 // 恢复归档的笔记历史版本。对于备份包中存在历史条目的笔记，先删除其当前历史版本
 // （覆盖策略），再按原始元数据重建归档条目；内容/补丁 sidecar 文件由仓储层写入。
-func (s *backupService) importNoteHistory(ctx context.Context, uid, vaultID int64, extractDir string) (int64, int64, error) {
-	data, err := os.ReadFile(filepath.Join(extractDir, filepath.FromSlash(BackupNoteHistoryFileName)))
-	if err != nil {
+// 笔记路径在笔记导入阶段之后解析到现有笔记。
+func (s *backupService) importNoteHistory(ctx context.Context, uid, vaultID int64, extractDir string, task *backupImportTask) (int64, int64, error) {
+	path := filepath.Join(extractDir, filepath.FromSlash(BackupNoteHistoryFileName))
+	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
 			// Archive contains no history section (incremental backup or none available)
 			// 备份包不含历史部分（增量备份或不可用）
@@ -512,15 +879,22 @@ func (s *backupService) importNoteHistory(ctx context.Context, uid, vaultID int6
 		return 0, 0, err
 	}
 
-	var entries []BackupNoteHistoryEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
+	// First pass: count + collect note paths present in the archive.
+	// 第一遍：计数并收集备份包涉及的笔记路径。
+	pathSet := make(map[string]struct{})
+	var err error
+	_, err = streamBackupHistory(extractDir, func(e *BackupNoteHistoryEntry) error {
+		pathSet[e.Path] = struct{}{}
+		return nil
+	})
+	if err != nil {
 		return 0, 0, code.ErrorBackupImportZipFailed.WithDetails("invalid note history data: " + err.Error())
 	}
-	if len(entries) == 0 {
+	if len(pathSet) == 0 {
 		return 0, 0, nil
 	}
 
-	notes, err := s.noteRepo.List(ctx, vaultID, 1, 1000000, uid, "", false, "", false, "", "", nil)
+	notes, err := s.listNotesPaginated(ctx, vaultID, uid)
 	if err != nil {
 		return 0, 0, code.ErrorDBQuery.WithDetails(err.Error())
 	}
@@ -533,11 +907,11 @@ func (s *backupService) importNoteHistory(ctx context.Context, uid, vaultID int6
 		idByPath[filepath.ToSlash(p)] = n.ID
 	}
 
-	// Clear existing history only for notes referenced by the archive
-	// 仅清空备份包引用的笔记的现有历史
+	// Clear existing history only for notes referenced by the archive.
+	// 仅清空备份包引用的笔记的现有历史。
 	affectedNotes := make(map[int64]struct{})
-	for _, e := range entries {
-		if id, ok := idByPath[e.Path]; ok {
+	for p := range pathSet {
+		if id, ok := idByPath[p]; ok {
 			affectedNotes[id] = struct{}{}
 		}
 	}
@@ -549,14 +923,12 @@ func (s *backupService) importNoteHistory(ctx context.Context, uid, vaultID int6
 	}
 
 	var imported, skipped int64
-	for _, e := range entries {
-		if ctx.Err() != nil {
-			return imported, skipped, ctx.Err()
-		}
+	progress := &importProgress{service: s, task: task}
+	_, err = streamBackupHistory(extractDir, func(e *BackupNoteHistoryEntry) error {
 		noteID, ok := idByPath[e.Path]
 		if !ok {
 			skipped++
-			continue
+			return nil
 		}
 		h := &domain.NoteHistory{
 			NoteID:        noteID,
@@ -586,18 +958,68 @@ func (s *backupService) importNoteHistory(ctx context.Context, uid, vaultID int6
 				zap.Int64("version", e.Version),
 				zap.Error(err))
 			skipped++
-			continue
+			return nil
 		}
 		imported++
+		progress.add(0, 0, 0, 1, 0)
+		return nil
+	})
+	if err != nil {
+		return imported, skipped, err
 	}
 	return imported, skipped, nil
+}
+
+// listNotesPaginated lists all notes of a vault in batches to avoid loading
+// everything at once for huge vaults.
+// 分页列出仓库全部笔记，避免大仓库一次性载入。
+func (s *backupService) listNotesPaginated(ctx context.Context, vaultID, uid int64) ([]*domain.Note, error) {
+	var result []*domain.Note
+	page := 1
+	for {
+		batch, err := s.noteRepo.List(ctx, vaultID, page, backupImportFIDPagination, uid, "", false, "", false, "", "", nil)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, batch...)
+		if len(batch) < backupImportFIDPagination {
+			break
+		}
+		page++
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return result, nil
+}
+
+// listFilesPaginated lists all attachments of a vault in batches.
+// 分页列出仓库全部附件。
+func (s *backupService) listFilesPaginated(ctx context.Context, vaultID, uid int64) ([]*domain.File, error) {
+	var result []*domain.File
+	page := 1
+	for {
+		batch, err := s.fileRepo.List(ctx, vaultID, page, backupImportFIDPagination, uid, "", false, "", "")
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, batch...)
+		if len(batch) < backupImportFIDPagination {
+			break
+		}
+		page++
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return result, nil
 }
 
 // rebuildResourceFIDs ensures folder records exist for all parent paths in the
 // vault and assigns FIDs to notes/attachments (mirrors folder service logic).
 // 确保仓库内所有父路径存在文件夹记录并为笔记/附件分配 FID (与文件夹服务逻辑一致)。
 func (s *backupService) rebuildResourceFIDs(ctx context.Context, uid, vaultID int64) error {
-	notes, err := s.noteRepo.List(ctx, vaultID, 1, 1000000, uid, "", false, "", false, "", "", nil)
+	notes, err := s.listNotesPaginated(ctx, vaultID, uid)
 	if err != nil {
 		return err
 	}
@@ -614,7 +1036,7 @@ func (s *backupService) rebuildResourceFIDs(ctx context.Context, uid, vaultID in
 		}
 	}
 
-	files, err := s.fileRepo.List(ctx, vaultID, 1, 1000000, uid, "", false, "", "")
+	files, err := s.listFilesPaginated(ctx, vaultID, uid)
 	if err != nil {
 		return err
 	}

@@ -63,8 +63,8 @@ func StringToInt64(s string) int64 {
 	return result
 }
 
-// ParseSize parses size string like "128MB", "512KB", "1024B" to bytes
-// ParseSize 将大小字符串（如 "128MB", "512KB", "1024B"）解析为字节数
+// ParseSize parses size string like "128MB", "512KB", "2GB", "1024B" to bytes
+// ParseSize 将大小字符串（如 "128MB", "512KB", "2GB", "1024B"）解析为字节数
 func ParseSize(sizeStr string, defaultSize int64) int64 {
 	if sizeStr == "" {
 		return defaultSize
@@ -73,7 +73,13 @@ func ParseSize(sizeStr string, defaultSize int64) int64 {
 	sizeStr = strings.ToUpper(strings.TrimSpace(sizeStr))
 	var multiplier int64 = 1
 
-	if strings.HasSuffix(sizeStr, "MB") {
+	if strings.HasSuffix(sizeStr, "TB") {
+		multiplier = 1024 * 1024 * 1024 * 1024
+		sizeStr = strings.TrimSuffix(sizeStr, "TB")
+	} else if strings.HasSuffix(sizeStr, "GB") {
+		multiplier = 1024 * 1024 * 1024
+		sizeStr = strings.TrimSuffix(sizeStr, "GB")
+	} else if strings.HasSuffix(sizeStr, "MB") {
 		multiplier = 1024 * 1024
 		sizeStr = strings.TrimSuffix(sizeStr, "MB")
 	} else if strings.HasSuffix(sizeStr, "KB") {

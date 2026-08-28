@@ -31,6 +31,12 @@ type AppSettings struct {
 	// HistorySaveDelay historical record save delay time, supports format: 10s (seconds), 1m (minutes), default 10s
 	// HistorySaveDelay历史记录保存延迟时间，支持格式：10s（秒）、1m（分钟），默认 10s
 	HistorySaveDelay string `yaml:"history-save-delay" default:"10s"`
+	// BackupImportSizeLimitEnabled toggles the backup import archive size limit; default true.
+	// 备份导入文件大小限制开关，默认开启。
+	BackupImportSizeLimitEnabled *bool `yaml:"backup-import-size-limit-enabled" default:"true"`
+	// BackupImportSizeLimit max backup import archive size, e.g. "512MB", "2GB"; default 2GB.
+	// 备份导入文件大小上限，支持 "512MB"、"2GB" 等格式，默认 2GB。
+	BackupImportSizeLimit string `yaml:"backup-import-size-limit" default:"2GB"`
 	// UploadSessionTimeout file upload session timeout duration
 	// UploadSessionTimeout 文件上传会话超时时间
 	UploadSessionTimeout string `yaml:"upload-session-timeout" default:"1d"`
@@ -38,7 +44,7 @@ type AppSettings struct {
 	// FileChunkSize 文件分片大小
 	FileChunkSize string `yaml:"file-chunk-size" default:"512KB"`
 	// DownloadSessionTimeout file chunk download timeout duration
-	// DownloadSessionTimeout 文件分片下载超时时间
+	// DownloadSessionTimeout 文件分片下载超时时长
 	DownloadSessionTimeout string `yaml:"download-session-timeout" default:"1h"`
 
 	// Worker Pool configurations

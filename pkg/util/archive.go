@@ -171,6 +171,28 @@ func UnzipWithPassword(source, targetDir, password string) error {
 	return nil
 }
 
+// IsZipFile reports whether the file starts with a ZIP magic signature:
+// PK\x03\x04 (local file header), PK\x05\x06 (empty archive/EOCD) or
+// PK\x07\x08 (split/spanned archive).
+// IsZipFile 判断文件是否以 ZIP 魔数开头：
+// PK\x03\x04 (本地文件头)、PK\x05\x06 (空归档/EOCD) 或 PK\x07\x08 (分卷归档)。
+func IsZipFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return false
+	}
+	return header[0] == 'P' && header[1] == 'K' &&
+		((header[2] == 0x03 && header[3] == 0x04) ||
+			(header[2] == 0x05 && header[3] == 0x06) ||
+			(header[2] == 0x07 && header[3] == 0x08))
+}
+
 // registerArchiveDecompressors registers decompressors beyond the yeka/zip
 // builtins (Store/Deflate): Bzip2 (12, stdlib) and Zstandard (93, klauspost).
 // The registration is process-global and done exactly once.

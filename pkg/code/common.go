@@ -138,10 +138,13 @@ var (
 	ErrorSyncConflict = NewError(530)
 
 	// --- Backup Import Related (540-549) ---
-	ErrorBackupImportFileEmpty     = NewError(540)
-	ErrorBackupImportZipFailed     = NewError(541)
-	ErrorBackupImportOptionInvalid = NewError(542)
+	ErrorBackupImportFileEmpty        = NewError(540)
+	ErrorBackupImportZipFailed        = NewError(541)
+	ErrorBackupImportOptionInvalid    = NewError(542)
 	ErrorBackupImportInvalidArchive   = NewError(544)
 	ErrorBackupImportSectionMissing   = NewError(545)
 	ErrorVaultSyncPaused              = NewError(546)
+	ErrorBackupImportNotZip           = NewError(547)
+	ErrorBackupImportFileTooLarge     = NewError(548)
+	ErrorBackupImportTaskNotFound     = NewError(549)
 )

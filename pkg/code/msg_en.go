@@ -138,4 +138,7 @@ var en_messages = map[int]string{
 	544: "Invalid backup archive (no importable content)",
 	545: "Requested sections are missing in the backup archive, you may import the available sections only",
 	546: "Vault sync is paused during data import, please try again later",
+	547: "Import file is not a valid ZIP archive",
+	548: "Import file exceeds the size limit",
+	549: "Import task not found, already finished, or the operation is not allowed in the current state",
 }

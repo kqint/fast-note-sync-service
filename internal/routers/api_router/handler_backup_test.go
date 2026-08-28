@@ -1,6 +1,8 @@
 package api_router
 
 import (
+	"bytes"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -138,4 +140,122 @@ func TestBackupHandler_Execute_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assertResponseCode(t, w, code.Success.Code())
 	mockSvc.AssertExpectations(t)
+}
+
+// TestBackupHandler_ImportStatus_Success verifies task status polling
+func TestBackupHandler_ImportStatus_Success(t *testing.T) {
+	mockSvc := new(svcmocks.MockBackupService)
+
+	mockData := &dto.BackupImportTaskStatusDTO{
+		TaskID: "abc123",
+		Phase:  "importing",
+		Totals: dto.BackupImportTotalsDTO{Notes: 10},
+		Progress: dto.BackupImportProgressDTO{Notes: 3},
+	}
+	mockSvc.On("GetImportTaskStatus", mock.Anything, int64(1), "abc123").Return(mockData, nil)
+
+	handler := newTestBackupHandler(mockSvc)
+	c, w := newBackupTestContext("GET", "/api/backup/import/status?taskId=abc123", "", 1)
+
+	handler.ImportStatus(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assertResponseCode(t, w, code.Success.Code())
+	mockSvc.AssertExpectations(t)
+}
+
+// TestBackupHandler_ImportConfirm_Success verifies await_partial confirm flow
+func TestBackupHandler_ImportConfirm_Success(t *testing.T) {
+	mockSvc := new(svcmocks.MockBackupService)
+
+	mockData := &dto.BackupImportTaskStatusDTO{
+		TaskID: "abc123",
+		Phase:  "importing",
+	}
+	mockSvc.On("ConfirmImportTask", mock.Anything, int64(1), "abc123", true).Return(mockData, nil)
+
+	handler := newTestBackupHandler(mockSvc)
+	body := `{"taskId":"abc123","allowPartial":true}`
+	c, w := newBackupTestContext("POST", "/api/backup/import/confirm", body, 1)
+
+	handler.ImportConfirm(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assertResponseCode(t, w, code.Success.Code())
+	mockSvc.AssertExpectations(t)
+}
+
+// TestBackupHandler_Import_Success verifies the async submit endpoint returns a task
+// (multipart body with a valid zip file is staged then passed to the mock service).
+func TestBackupHandler_Import_Success(t *testing.T) {
+	mockSvc := new(svcmocks.MockBackupService)
+
+	mockTask := &dto.BackupImportTaskDTO{TaskID: "abc123", Phase: "validating"}
+	mockSvc.On("SubmitImportBackup", mock.Anything, int64(1), mock.AnythingOfType("*dto.BackupImportRequest"), mock.AnythingOfType("string")).
+		Return(mockTask, nil)
+
+	handler := newTestBackupHandler(mockSvc)
+
+	// Build a tiny real zip file and multipart body
+	zipBytes := []byte("PK\x03\x04") // magic-only header is enough for IsZipFile
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "b.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(zipBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("vault", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/api/backup/import", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+	c.Set("user_token", &pkgapp.UserEntity{UID: 1})
+
+	handler.Import(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assertResponseCode(t, w, code.SuccessCreate.Code())
+	mockSvc.AssertExpectations(t)
+}
+
+// TestBackupHandler_Import_NotZip rejects non-ZIP uploads with 547 before calling the service.
+func TestBackupHandler_Import_NotZip(t *testing.T) {
+	mockSvc := new(svcmocks.MockBackupService)
+
+	handler := newTestBackupHandler(mockSvc)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, _ := writer.CreateFormFile("file", "fake.exe")
+	_, _ = part.Write([]byte("MZ\x90\x00not a zip"))
+	_ = writer.WriteField("vault", "main")
+	_ = writer.Close()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/backup/import", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+	c.Set("user_token", &pkgapp.UserEntity{UID: 1})
+
+	handler.Import(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assertResponseCode(t, w, code.ErrorBackupImportNotZip.Code())
+	mockSvc.AssertNotCalled(t, "SubmitImportBackup", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }

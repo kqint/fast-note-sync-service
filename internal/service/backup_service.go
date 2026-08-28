@@ -45,10 +45,17 @@ type BackupService interface {
 	ExecuteUserBackup(ctx context.Context, uid int64, configID int64) error
 	ExecuteTaskBackups(ctx context.Context) error
 	NotifyUpdated(uid int64)
-	// ImportBackup imports a backup archive into the target vault with an
-	// overwrite strategy. Takes ownership of zipPath and removes it when done.
-	// 以覆盖策略将备份包导入目标仓库。方法接管 zipPath 并在完成后删除该文件。
-	ImportBackup(ctx context.Context, uid int64, req *dto.BackupImportRequest, zipPath string) (*dto.BackupImportResultDTO, error)
+	// SubmitImportBackup validates the upload quickly and starts an asynchronous
+	// import task, returning its id and initial phase. Takes ownership of zipPath
+	// (removed when the task finishes).
+	// 快速校验上传文件并启动异步导入任务，返回任务 ID 与初始阶段。接管 zipPath，任务结束时删除。
+	SubmitImportBackup(ctx context.Context, uid int64, req *dto.BackupImportRequest, zipPath string) (*dto.BackupImportTaskDTO, error)
+	// GetImportTaskStatus returns the snapshot of an import task owned by uid.
+	// GetImportTaskStatus 返回当前用户导入任务的状态快照。
+	GetImportTaskStatus(ctx context.Context, uid int64, taskID string) (*dto.BackupImportTaskStatusDTO, error)
+	// ConfirmImportTask confirms (or cancels) an await_partial task.
+	// ConfirmImportTask 确认（或取消）处于 await_partial 的导入任务。
+	ConfirmImportTask(ctx context.Context, uid int64, taskID string, allowPartial bool) (*dto.BackupImportTaskStatusDTO, error)
 	Shutdown(ctx context.Context) error
 }
 
@@ -60,18 +67,21 @@ type backupService struct {
 	vaultRepo       domain.VaultRepository
 	settingRepo     domain.SettingRepository
 	noteHistoryRepo domain.NoteHistoryRepository
-	storageService  StorageService
-	storageConfig   *config.StorageConfig
-	tempPath        string
-	logger          *zap.Logger
-	syncTimers      map[int64]*time.Timer
-	timerMu         sync.Mutex
-	ctx             context.Context
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
-	pendingSyncs    sync.Map                     // key: uid (int64), value: bool
-	runningTasks    map[int64]context.CancelFunc // key: configID
-	runningMu       sync.Mutex
+	storageService StorageService
+	storageConfig  *config.StorageConfig
+	tempPath       string
+	logger         *zap.Logger
+	syncTimers     map[int64]*time.Timer
+	timerMu        sync.Mutex
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	pendingSyncs   sync.Map                     // key: uid (int64), value: bool
+	runningTasks   map[int64]context.CancelFunc // key: configID
+	runningMu      sync.Mutex
+	importTasks      sync.Map // taskID -> *backupImportTask
+	importLimitOn    bool
+	importLimitBytes int64
 }
 
 // NewBackupService creates BackupService instance
@@ -88,6 +98,8 @@ func NewBackupService(
 	storageConfig *config.StorageConfig,
 	tempPath string,
 	logger *zap.Logger,
+	importLimitEnabled bool,
+	importLimitBytes int64,
 ) BackupService {
 	if tempPath == "" {
 		tempPath = "storage/temp"
@@ -109,6 +121,8 @@ func NewBackupService(
 		runningTasks:    make(map[int64]context.CancelFunc),
 		ctx:             ctx,
 		cancel:          cancel,
+		importLimitOn:   importLimitEnabled,
+		importLimitBytes: importLimitBytes,
 	}
 
 	// Startup sweep: reclaim orphaned backup staging files left behind by a

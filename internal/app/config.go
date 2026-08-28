@@ -106,6 +106,23 @@ func (c *AppConfig) Save() error {
 	return nil
 }
 
+// GetBackupImportSizeLimit resolves the backup import size limit from config.
+// Returns (enabled, limitBytes); when enabled the limit defaults to 2GB on
+// missing/invalid values. A nil pointer (config built without LoadConfig)
+// falls back to enabled with 2GB defensively.
+// GetBackupImportSizeLimit 从配置解析备份导入大小限制，返回 (是否启用, 上限字节数)。
+// 启用时缺失/非法配置回退默认 2GB；nil 指针（未经 LoadConfig 构造的配置）防御性回退启用 + 2GB。
+func (c *AppConfig) GetBackupImportSizeLimit() (bool, int64) {
+	const fallback = int64(2) << 30 // 2GB
+	if c.App.BackupImportSizeLimitEnabled == nil {
+		return true, fallback
+	}
+	if !*c.App.BackupImportSizeLimitEnabled {
+		return false, 0
+	}
+	return true, util.ParseSize(c.App.BackupImportSizeLimit, fallback)
+}
+
 // GetWorkerPoolConfig gets Worker Pool configuration
 // GetWorkerPoolConfig 获取 Worker Pool 配置
 func (c *AppConfig) GetWorkerPoolConfig() workerpool.Config {
@@ -162,3 +179,9 @@ func (c *AppConfig) GetShareTokenExpiry() time.Duration {
 	return 30 * 24 * time.Hour // Theoretically will not reach here because of default values
 	// 理论上不会走到这里，因为有默认值
 }
+
+const (
+	// DefaultBackupImportSizeLimitBytes is the fallback import size limit (2GB).
+	// DefaultBackupImportSizeLimitBytes 备份导入大小限制的兜底值（2GB）。
+	DefaultBackupImportSizeLimitBytes = 2 * 1024 * 1024 * 1024
+)

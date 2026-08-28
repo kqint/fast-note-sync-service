@@ -69,6 +69,65 @@ type BackupImportResultDTO struct {
 	Vault          string `json:"vault"`                   // Target vault name // 目标仓库名称
 }
 
+// BackupImportTaskDTO 导入任务提交结果
+// BackupImportTaskDTO backup import task submission result
+type BackupImportTaskDTO struct {
+	TaskID string `json:"taskId"` // Task ID // 任务 ID
+	Phase  string `json:"phase"`  // Task phase: validating | await_partial | importing | success | failed | cancelled // 任务阶段
+}
+
+// BackupImportTotalsDTO 导入任务扫描总数
+// BackupImportTotalsDTO backup import task scanned totals
+type BackupImportTotalsDTO struct {
+	Notes       int64 `json:"notes"`       // Note file count // 笔记文件数
+	Files       int64 `json:"files"`       // Attachment count // 附件数
+	Settings    int64 `json:"settings"`    // Vault config count // 仓库配置数
+	NoteHistory int64 `json:"noteHistory"` // Note history entries // 笔记历史条数
+}
+
+// BackupImportProgressDTO 导入任务处理进度
+// BackupImportProgressDTO backup import task processing progress
+type BackupImportProgressDTO struct {
+	Notes          int64 `json:"notes"`          // Imported notes // 已导入笔记
+	Files          int64 `json:"files"`          // Imported attachments // 已导入附件
+	Settings       int64 `json:"settings"`       // Imported vault config // 已导入仓库配置
+	NoteHistory    int64 `json:"noteHistory"`    // Imported note history // 已导入笔记历史
+	SkippedHistory int64 `json:"skippedHistory"` // Skipped history entries // 跳过的历史条数
+}
+
+// BackupImportTaskErrorDTO 导入任务错误信息
+// BackupImportTaskErrorDTO backup import task error info
+type BackupImportTaskErrorDTO struct {
+	Code    int    `json:"code"`    // Error code // 错误码
+	Message string `json:"message"` // Error message // 错误消息
+}
+
+// BackupImportTaskStatusDTO 导入任务状态快照
+// BackupImportTaskStatusDTO backup import task status snapshot
+type BackupImportTaskStatusDTO struct {
+	TaskID    string                      `json:"taskId"`    // Task ID // 任务 ID
+	Phase     string                      `json:"phase"`     // Task phase // 任务阶段
+	Totals    BackupImportTotalsDTO       `json:"totals"`    // Scanned totals (after scan) // 扫描总数（扫描完成后填充）
+	Progress  BackupImportProgressDTO     `json:"progress"`  // Processing progress // 处理进度
+	Available *BackupImportAvailabilityDTO `json:"available,omitempty"` // Available sections (await_partial) // 备份包中存在的部分
+	Missing   []string                    `json:"missing,omitempty"`   // Requested but missing sections // 已勾选但缺失的部分
+	Result    *BackupImportResultDTO      `json:"result,omitempty"`    // Final result (success) // 最终结果（成功时）
+	Error     *BackupImportTaskErrorDTO   `json:"error,omitempty"`     // Error (failed) // 错误信息（失败时）
+}
+
+// BackupImportConfirmRequest 导入任务确认请求
+// BackupImportConfirmRequest backup import task confirm request
+type BackupImportConfirmRequest struct {
+	TaskID       string `json:"taskId" binding:"required" example:"6f0c..."` // Task ID // 任务 ID
+	AllowPartial bool   `json:"allowPartial" example:"true"`                 // true: import available sections only; false: cancel // true: 仅导入已有部分; false: 放弃本次导入
+}
+
+// BackupImportTaskQuery 导入任务状态查询
+// BackupImportTaskQuery backup import task status query
+type BackupImportTaskQuery struct {
+	TaskID string `json:"taskId" form:"taskId" binding:"required" example:"6f0c..."` // Task ID // 任务 ID
+}
+
 // BackupConfigDTO backup configuration DTO
 // BackupConfigDTO 备份配置 DTO
 type BackupConfigDTO struct {

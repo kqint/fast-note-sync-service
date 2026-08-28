@@ -229,6 +229,8 @@ func registerAPIRoutes(r *gin.Engine, appContainer *app.App, wss *pkgapp.Websock
 				webguiGroup.GET("/backup/historys", backupHandler.ListHistory)
 				webguiGroup.POST("/backup/execute", backupHandler.Execute)
 				webguiGroup.POST("/backup/import", backupHandler.Import)
+				webguiGroup.GET("/backup/import/status", backupHandler.ImportStatus)
+				webguiGroup.POST("/backup/import/confirm", backupHandler.ImportConfirm)
 
 				// Git sync routes
 				// Git 同步接口
