@@ -69,6 +69,10 @@ type backupImportTask struct {
 	errMsg    string
 	finishedAt time.Time
 	confirmCh chan bool
+	// history is the persisted row created at submit time (nil when persistence
+	// failed). Guarded by mu like every other mutable field.
+	// history 为提交时落库的那一行（落库失败时为 nil）。与其它可变字段一样受 mu 保护。
+	history *domain.BackupImportHistory
 }
 
 func (t *backupImportTask) snapshot() *dto.BackupImportTaskStatusDTO {
@@ -132,13 +136,14 @@ func (s *backupService) SubmitImportBackup(ctx context.Context, uid int64, req *
 	// Authoritative size check (layer 3; handler already checked Content-Length
 	// and multipart header earlier). Resolved live from app settings so
 	// system-settings changes take effect immediately.
+	// The stat result is reused for the import history record below.
 	// 权威大小校验（第三层；handler 已在前两处检查 Content-Length 与 multipart 头）。
-	// 从应用设置实时解析，系统设置修改后立即生效。
+	// 从应用设置实时解析，系统设置修改后立即生效。stat 结果复用于下方导入历史记录。
+	info, statErr := os.Stat(zipPath)
 	if s.appSettings != nil {
 		if limitEnabled, limitBytes := s.appSettings.BackupImportSizeLimitResolved(); limitEnabled {
-			info, err := os.Stat(zipPath)
-			if err != nil {
-				return nil, code.ErrorBackupImportFileEmpty.WithDetails(err.Error())
+			if statErr != nil {
+				return nil, code.ErrorBackupImportFileEmpty.WithDetails(statErr.Error())
 			}
 			if info.Size() > limitBytes {
 				return nil, code.ErrorBackupImportFileTooLarge.
@@ -173,10 +178,115 @@ func (s *backupService) SubmitImportBackup(ctx context.Context, uid int64, req *
 	owned = true
 	s.sweepFinishedImportTasksLocked()
 
+	// Persist the history row before the goroutine starts so the record exists
+	// even if the process dies mid-import (final state is patched by the task).
+	// Failure here must not block the import itself.
+	// 在 goroutine 启动前落库历史记录，保证进程中途死亡时记录仍然存在
+	// （终态由任务回填）。此处的失败不应阻断导入本身。
+	fileSize := int64(0)
+	if statErr == nil {
+		fileSize = info.Size()
+	}
+	s.createImportHistory(task, fileSize)
+
 	s.wg.Add(1)
 	go s.runImportTask(task)
 
 	return &dto.BackupImportTaskDTO{TaskID: taskID, Phase: importPhaseValidating}, nil
+}
+
+// createImportHistory inserts the "running" row for a freshly accepted task.
+// Uses a detached context so the record survives a client disconnect; failures
+// are logged and leave task.history nil (no history, import still runs).
+// 为新接受的任务插入 running 记录。使用脱离请求的上下文，客户端断开也能落库；
+// 失败只记日志并让 task.history 保持 nil（无历史记录，导入照常执行）。
+func (s *backupService) createImportHistory(task *backupImportTask, fileSize int64) {
+	if s.backupRepo == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	h := &domain.BackupImportHistory{
+		UID:                 task.uid,
+		TaskID:              task.taskID,
+		VaultName:           task.req.Vault,
+		FileName:            task.req.FileName,
+		FileSize:            fileSize,
+		Status:              domain.BackupImportStatusRunning,
+		StartTime:           time.Now(),
+		IncludeNotes:        task.req.IncludeNotes,
+		IncludeVaultConfig:  task.req.IncludeVaultConfig,
+		IncludeNoteHistory:  task.req.IncludeNoteHistory,
+		AllowPartial:        task.req.AllowPartial,
+	}
+
+	saved, err := s.backupRepo.CreateImportHistory(ctx, h, task.uid)
+	if err != nil {
+		s.logger.Error("Failed to create backup import history",
+			zap.Int64("uid", task.uid), zap.String("taskId", task.taskID), zap.Error(err))
+		return
+	}
+	task.mu.Lock()
+	task.history = saved
+	task.mu.Unlock()
+}
+
+// finalizeImportHistory writes the terminal state into the history row. It is
+// called from runImportTask, which is the single exit point of the goroutine, so
+// it covers every path: success, failure (via finishImportTask) and the three
+// in-task cancellations that return nil without going through finishImportTask.
+// 将终态写回历史记录。由 runImportTask（goroutine 的唯一出口）调用，因此覆盖所有
+// 路径：成功、失败（经 finishImportTask），以及三个直接 return nil 的取消分支。
+func (s *backupService) finalizeImportHistory(task *backupImportTask) {
+	task.mu.Lock()
+	h := task.history
+	if h == nil {
+		task.mu.Unlock()
+		return
+	}
+
+	switch task.phase {
+	case importPhaseSuccess:
+		h.Status = domain.BackupImportStatusSuccess
+	case importPhaseCancelled:
+		h.Status = domain.BackupImportStatusCancelled
+	case importPhaseFailed:
+		h.Status = domain.BackupImportStatusFailed
+		h.Message = task.errMsg
+	default:
+		// Defensive: every exit path above should have set a terminal phase. Never
+		// leave the row "running" forever, which would outlive the process.
+		// 兜底：上述出口都应已设置终态。绝不能让记录永久停留在 running。
+		h.Status = domain.BackupImportStatusStopped
+		h.Message = "Import ended in an unexpected phase: " + task.phase
+	}
+	if task.result != nil {
+		h.NotesCount = task.result.Notes
+		h.FilesCount = task.result.Files
+		h.SettingsCount = task.result.Settings
+		h.NoteHistoryCount = task.result.NoteHistory
+		h.SkippedHistoryCount = task.result.SkippedHistory
+	}
+	endTime := task.finishedAt
+	if endTime.IsZero() {
+		endTime = time.Now()
+	}
+	h.EndTime = endTime
+	if !h.StartTime.IsZero() && endTime.After(h.StartTime) {
+		h.DurationMs = endTime.Sub(h.StartTime).Milliseconds()
+	}
+	task.mu.Unlock()
+
+	if s.backupRepo == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.backupRepo.SaveImportHistory(ctx, h, task.uid); err != nil {
+		s.logger.Error("Failed to finalize backup import history",
+			zap.Int64("uid", task.uid), zap.String("taskId", task.taskID), zap.Error(err))
+	}
 }
 
 // GetImportTaskStatus returns the status snapshot of a uid-owned task.
@@ -255,6 +365,10 @@ func (s *backupService) sweepFinishedImportTasksLocked() {
 // 后台执行单个导入任务。
 func (s *backupService) runImportTask(task *backupImportTask) {
 	defer s.wg.Done()
+	// Registered first so it runs last: files are cleaned up before the terminal
+	// state is persisted. Covers every exit path of runImportTaskInner.
+	// 最先注册即最后执行：先清理暂存文件，再持久化终态。覆盖 runImportTaskInner 的所有出口。
+	defer s.finalizeImportHistory(task)
 
 	// Any outcome removes staged files; the task entry itself stays in memory
 	// for retention polling.

@@ -56,6 +56,9 @@ type BackupService interface {
 	// ConfirmImportTask confirms (or cancels) an await_partial task.
 	// ConfirmImportTask 确认（或取消）处于 await_partial 的导入任务。
 	ConfirmImportTask(ctx context.Context, uid int64, taskID string, allowPartial bool) (*dto.BackupImportTaskStatusDTO, error)
+	// ListImportHistory lists the persisted import history of a user (newest first).
+	// ListImportHistory 分页查询用户的导入历史（最新在前）。
+	ListImportHistory(ctx context.Context, uid int64, pager *app.Pager) ([]*dto.BackupImportHistoryDTO, int64, error)
 	Shutdown(ctx context.Context) error
 }
 
@@ -135,7 +138,31 @@ func NewBackupService(
 		logger.Warn("Failed to recreate backup staging dir", zap.String("dir", stagingDir), zap.Error(err))
 	}
 
+	// Startup sweep: import tasks live only in memory, so a record still in
+	// "running" after a restart can never reach a terminal state on its own.
+	// Mark them stopped so the history never shows a phantom in-progress import.
+	// 启动兜底：导入任务只存在于内存，重启后仍为 running 的记录不可能自行进入终态，
+	// 统一置为 stopped，避免历史列表出现永远"进行中"的幽灵记录。
+	s.stopOrphanImportHistories()
+
 	return s
+}
+
+// stopOrphanImportHistories best-effort sweep of running import history records.
+// Import history is persisted at submit time (status=running) and finalized when
+// the in-memory task reaches a terminal state. A restart loses those tasks, so
+// without this sweep their rows would stay "running" forever.
+// 尽力清理残留的 running 导入历史：历史在提交时落库（running），任务终态时回填；
+// 重启会丢失内存任务，不做清理这些行将永久停留在 running。
+func (s *backupService) stopOrphanImportHistories() {
+	if s.backupRepo == nil {
+		return
+	}
+	sweepCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.backupRepo.StopOrphanImportHistories(sweepCtx); err != nil && s.logger != nil {
+		s.logger.Warn("Failed to sweep orphaned backup import histories", zap.Error(err))
+	}
 }
 
 // backupStagingDir returns the directory used to stage in-progress backup
@@ -371,6 +398,51 @@ func (s *backupService) ListHistory(ctx context.Context, uid int64, configID int
 		results = append(results, s.historyToDTO(h))
 	}
 	return results, count, nil
+}
+
+// ListImportHistory List backup import history with pagination
+// 分页查询备份导入历史记录
+func (s *backupService) ListImportHistory(ctx context.Context, uid int64, pager *app.Pager) ([]*dto.BackupImportHistoryDTO, int64, error) {
+	histories, count, err := s.backupRepo.ListImportHistory(ctx, uid, pager.Page, pager.PageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var results []*dto.BackupImportHistoryDTO
+	for _, h := range histories {
+		results = append(results, s.importHistoryToDTO(h))
+	}
+	return results, count, nil
+}
+
+func (s *backupService) importHistoryToDTO(d *domain.BackupImportHistory) *dto.BackupImportHistoryDTO {
+	if d == nil {
+		return nil
+	}
+	return &dto.BackupImportHistoryDTO{
+		ID:                  d.ID,
+		UID:                 d.UID,
+		TaskID:              d.TaskID,
+		VaultName:           d.VaultName,
+		FileName:            d.FileName,
+		FileSize:            d.FileSize,
+		Status:              d.Status,
+		StartTime:           timex.Time(d.StartTime),
+		EndTime:             timex.Time(d.EndTime),
+		DurationMs:          d.DurationMs,
+		IncludeNotes:        d.IncludeNotes,
+		IncludeVaultConfig:  d.IncludeVaultConfig,
+		IncludeNoteHistory:  d.IncludeNoteHistory,
+		AllowPartial:        d.AllowPartial,
+		NotesCount:          d.NotesCount,
+		FilesCount:          d.FilesCount,
+		SettingsCount:       d.SettingsCount,
+		NoteHistoryCount:    d.NoteHistoryCount,
+		SkippedHistoryCount: d.SkippedHistoryCount,
+		Message:             d.Message,
+		CreatedAt:           timex.Time(d.CreatedAt),
+		UpdatedAt:           timex.Time(d.UpdatedAt),
+	}
 }
 
 func (s *backupService) configToDTO(ctx context.Context, d *domain.BackupConfig) *dto.BackupConfigDTO {

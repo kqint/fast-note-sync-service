@@ -41,6 +41,10 @@ type BackupImportRequest struct {
 	IncludeVaultConfig bool   `json:"includeVaultConfig" form:"includeVaultConfig" example:"false"` // Import vault config (.obsidian) // 导入仓库配置 (.obsidian)
 	IncludeNoteHistory bool   `json:"includeNoteHistory" form:"includeNoteHistory" example:"false"` // Import note history (requires IncludeNotes) // 导入笔记历史 (需勾选笔记和附件)
 	AllowPartial       bool   `json:"allowPartial" form:"allowPartial" example:"false"`      // Allow importing only the sections actually present // 允许仅导入备份包中实际存在的部分
+	// FileName carries the original upload name for the history record. It is
+	// filled by the handler from the multipart header, never bound from the form.
+	// FileName 记录上传时的原始文件名，仅供导入历史使用；由处理层从 multipart 头填入，不从表单绑定。
+	FileName string `json:"fileName" form:"-"`
 }
 
 // BackupImportAvailabilityDTO 备份包中各部分的存在情况
@@ -126,6 +130,40 @@ type BackupImportConfirmRequest struct {
 // BackupImportTaskQuery backup import task status query
 type BackupImportTaskQuery struct {
 	TaskID string `json:"taskId" form:"taskId" binding:"required" example:"6f0c..."` // Task ID // 任务 ID
+}
+
+// BackupImportHistoryListRequest 导入历史列表请求
+// BackupImportHistoryListRequest backup import history list request
+type BackupImportHistoryListRequest struct {
+	Page     int `json:"page" form:"page" example:"1"`         // Page number // 页码
+	PageSize int `json:"pageSize" form:"pageSize" example:"10"` // Page size // 每页大小
+}
+
+// BackupImportHistoryDTO 导入历史记录
+// BackupImportHistoryDTO backup import history record
+type BackupImportHistoryDTO struct {
+	ID                  int64      `json:"id"`                  // Record ID // 记录 ID
+	UID                 int64      `json:"uid"`                 // User UID // 用户 ID
+	TaskID              string     `json:"taskId"`              // Import task ID // 导入任务 ID
+	VaultName           string     `json:"vaultName"`           // Target vault name // 目标仓库名称
+	FileName            string     `json:"fileName"`            // Original archive name // 上传时原始文件名
+	FileSize            int64      `json:"fileSize"`            // Archive size in bytes // 备份包字节数
+	Status              int        `json:"status"`              // 0: Running, 1: Success, 2: Failed, 3: Cancelled, 4: Stopped // 状态
+	StartTime           timex.Time `json:"startTime"`           // Submit time // 提交时间
+	EndTime             timex.Time `json:"endTime"`             // Terminal state time // 进入终态的时间
+	DurationMs          int64      `json:"durationMs"`          // EndTime - StartTime in ms // 耗时（毫秒）
+	IncludeNotes        bool       `json:"includeNotes"`        // Requested: notes & attachments // 勾选：笔记和附件
+	IncludeVaultConfig  bool       `json:"includeVaultConfig"`  // Requested: vault config // 勾选：仓库配置
+	IncludeNoteHistory  bool       `json:"includeNoteHistory"`  // Requested: note history // 勾选：笔记历史
+	AllowPartial        bool       `json:"allowPartial"`        // Requested: allow partial import // 勾选：允许部分导入
+	NotesCount          int64      `json:"notesCount"`          // Imported notes // 导入笔记数
+	FilesCount          int64      `json:"filesCount"`          // Imported attachments // 导入附件数
+	SettingsCount       int64      `json:"settingsCount"`       // Imported vault config entries // 导入仓库配置数
+	NoteHistoryCount    int64      `json:"noteHistoryCount"`    // Imported note history entries // 导入笔记历史条数
+	SkippedHistoryCount int64      `json:"skippedHistoryCount"` // Skipped history entries // 跳过的历史条数
+	Message             string     `json:"message"`             // Error message (failed) // 错误信息（失败时）
+	CreatedAt           timex.Time `json:"createdAt"`           // Created at // 创建时间
+	UpdatedAt           timex.Time `json:"updatedAt"`           // Updated at // 更新时间
 }
 
 // BackupConfigDTO backup configuration DTO

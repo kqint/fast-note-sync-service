@@ -257,6 +257,11 @@ func (h *BackupHandler) Import(c *gin.Context) {
 		return
 	}
 
+	// Keep the original upload name for the import history record. It is not read
+	// from the form (form:"-") to avoid trusting a client-supplied value.
+	// 保留上传时的原始文件名用于导入历史。不从表单读取（form:"-"），避免信任客户端传入值。
+	params.FileName = fileHeader.Filename
+
 	// Size limit checks, layer 1 & 2: reject before streaming the whole body.
 	// 大小限制·第 1、2 层：在流式转储前即拒绝。
 	limitEnabled, limitBytes := h.App.Config().GetBackupImportSizeLimit()
@@ -390,6 +395,44 @@ func (h *BackupHandler) ImportConfirm(c *gin.Context) {
 	}
 
 	response.ToResponse(code.Success.WithData(status))
+}
+
+// ListImportHistory gets backup import history list
+// @Summary Get backup import history list
+// @Description Paginated import history for the current user, newest first. Records are created when an import is submitted and finalized once the task reaches a terminal state
+// @Tags Backup
+// @Security UserAuthToken
+// @Produce json
+// @Param params query dto.BackupImportHistoryListRequest true "Backup Import History List Parameters"
+// @Success 200 {object} pkgapp.Res{data=pkgapp.ListRes{list=[]dto.BackupImportHistoryDTO}} "Success"
+// @Failure 400 {object} pkgapp.Res "Invalid Params"
+// @Failure 401 {object} pkgapp.Res "Token Required"
+// @Failure 500 {object} pkgapp.Res "Internal Server Error"
+// @Router /api/backup/import/historys [get]
+func (h *BackupHandler) ListImportHistory(c *gin.Context) {
+	response := pkgapp.NewResponse(c)
+	params := &dto.BackupImportHistoryListRequest{}
+	pager := pkgapp.NewPager(c)
+
+	if valid, errs := pkgapp.BindAndValid(c, params); !valid {
+		response.ToResponse(code.ErrorInvalidParams.WithDetails(errs.ErrorsToString()).WithData(errs.MapsToString()))
+		return
+	}
+
+	uid := pkgapp.GetUID(c)
+	if uid == 0 {
+		response.ToResponse(code.ErrorNotUserAuthToken)
+		return
+	}
+
+	list, total, err := h.App.BackupService.ListImportHistory(c.Request.Context(), uid, pager)
+	if err != nil {
+		h.logError(c.Request.Context(), "BackupHandler.ListImportHistory", err)
+		apperrors.ErrorResponse(c, err)
+		return
+	}
+
+	response.ToResponseList(code.Success, list, int(total))
 }
 
 func (h *BackupHandler) logError(ctx context.Context, method string, err error) {

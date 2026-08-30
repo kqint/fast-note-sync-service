@@ -14,6 +14,18 @@ const (
 	BackupStatusNoUpdate = 5
 )
 
+// Backup import history statuses. Deliberately separate from the export/sync
+// statuses above: imports have no "idle"/"no update" state but add "cancelled".
+// 备份导入历史状态。与上面的导出/同步状态分开定义：导入没有 idle / 无更新态，
+// 但多了"已取消"这一终态。
+const (
+	BackupImportStatusRunning   = 0
+	BackupImportStatusSuccess   = 1
+	BackupImportStatusFailed    = 2
+	BackupImportStatusCancelled = 3
+	BackupImportStatusStopped   = 4
+)
+
 // BackupConfig 备份配置领域模型
 type BackupConfig struct {
 	ID               int64
@@ -55,6 +67,34 @@ type BackupHistory struct {
 	UpdatedAt time.Time
 }
 
+// BackupImportHistory 备份包导入历史领域模型
+// 一条记录对应一次「提交导入」请求，从提交即落库（running），
+// 到任务进入终态（success / failed / cancelled / stopped）时回填结果。
+type BackupImportHistory struct {
+	ID                  int64
+	UID                 int64
+	TaskID              string    // 内存态导入任务 ID，用于日志与数据库互相定位
+	VaultName           string    // 目标仓库名称
+	FileName            string    // 上传的原始备份包名
+	FileSize            int64     // 备份包字节数
+	Status              int       // 0: Running, 1: Success, 2: Failed, 3: Cancelled, 4: Stopped
+	StartTime           time.Time // 提交时间
+	EndTime             time.Time // 进入终态的时间
+	DurationMs          int64     // EndTime - StartTime（毫秒）
+	IncludeNotes        bool      // 提交时勾选：导入笔记和附件
+	IncludeVaultConfig  bool      // 提交时勾选：导入仓库配置 (.obsidian)
+	IncludeNoteHistory  bool      // 提交时勾选：导入笔记历史
+	AllowPartial        bool      // 提交时勾选：允许仅导入备份包中实际存在的部分
+	NotesCount          int64     // 导入(覆盖)的笔记数
+	FilesCount          int64     // 导入(覆盖)的附件数
+	SettingsCount       int64     // 导入(覆盖)的仓库配置数
+	NoteHistoryCount    int64     // 导入的笔记历史条数
+	SkippedHistoryCount int64     // 跳过的笔记历史条数（对应笔记不存在）
+	Message             string    // 失败时的错误信息
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
 // BackupRepository 备份仓储接口
 type BackupRepository interface {
 	// ListConfigs 获取用户的备份配置列表
@@ -83,4 +123,13 @@ type BackupRepository interface {
 
 	// DisableByVaultID 禁用仓库下的备份任务
 	DisableByVaultID(ctx context.Context, vaultID, uid int64) error
+
+	// CreateImportHistory 创建一条导入历史记录（提交即落库，状态为 running）
+	CreateImportHistory(ctx context.Context, history *BackupImportHistory, uid int64) (*BackupImportHistory, error)
+	// SaveImportHistory 更新一条已存在的导入历史记录（回填终态与统计）
+	SaveImportHistory(ctx context.Context, history *BackupImportHistory, uid int64) error
+	// ListImportHistory 分页获取导入历史记录
+	ListImportHistory(ctx context.Context, uid int64, page, pageSize int) ([]*BackupImportHistory, int64, error)
+	// StopOrphanImportHistories 将所有用户的 running 记录置为 stopped（服务重启后收尾）
+	StopOrphanImportHistories(ctx context.Context) error
 }

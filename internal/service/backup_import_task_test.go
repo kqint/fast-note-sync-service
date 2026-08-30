@@ -56,6 +56,20 @@ func newImportTestService(t *testing.T) (*backupService, *mocks.MockNoteReposito
 
 	backupRepo := new(mocks.MockBackupRepository)
 
+	// Import history persistence. One shared row stands in for the DB row:
+	// CreateImportHistory copies the submitted fields onto it and stamps an ID,
+	// mirroring the real repository, so tests can assert both the submit-time
+	// snapshot and the terminal state written afterwards.
+	// 导入历史落库。用一行共享记录代替数据库记录：CreateImportHistory 把提交的字段
+	// 复制过去并打上 ID（与真实仓储一致），便于断言提交时快照与之后的终态。
+	stubRow := &domain.BackupImportHistory{}
+	backupRepo.On("CreateImportHistory", mock.Anything, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			*stubRow = *args.Get(1).(*domain.BackupImportHistory)
+			stubRow.ID = 1
+		}).Return(stubRow, nil)
+	backupRepo.On("SaveImportHistory", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
 	s := &backupService{
 		backupRepo:      backupRepo,
 		noteRepo:        noteRepo,
@@ -278,5 +292,157 @@ func TestImportTask_SizeLimit(t *testing.T) {
 	}
 	if c, ok := err.(*code.Code); !ok || c.Code() != code.ErrorBackupImportFileTooLarge.Code() {
 		t.Fatalf("expected 548 code, got %v", err)
+	}
+}
+
+// readImportHistory returns a snapshot of the task's history row, copied while
+// holding the task mutex. It must copy: the service keeps mutating the same
+// struct in finalizeImportHistory, so handing the caller the live pointer would
+// let it read fields outside the lock and trip the race detector.
+// 返回任务历史记录的快照副本（在任务锁内拷贝）。必须拷贝：服务会在
+// finalizeImportHistory 中持续修改同一个结构体，若把真实指针交给调用方，
+// 调用方就会在锁外读取字段，从而触发竞态检测。
+func readImportHistory(t *testing.T, s *backupService, taskID string) *domain.BackupImportHistory {
+	t.Helper()
+	v, ok := s.importTasks.Load(taskID)
+	if !ok {
+		t.Fatalf("task %q not found", taskID)
+	}
+	task := v.(*backupImportTask)
+	task.mu.Lock()
+	defer task.mu.Unlock()
+	if task.history == nil {
+		return nil
+	}
+	snapshot := *task.history
+	return &snapshot
+}
+
+// waitForTerminalHistory polls until the task's history row leaves the running
+// status. finalizeImportHistory runs as a deferred call, i.e. slightly after the
+// phase itself flips, so the phase check alone is not enough.
+// 轮询直到历史记录离开 running 状态。终态回填是 defer 调用，略晚于阶段切换，
+// 因此仅检查阶段还不够。
+func waitForTerminalHistory(t *testing.T, s *backupService, taskID string) *domain.BackupImportHistory {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if h := readImportHistory(t, s, taskID); h != nil && h.Status != domain.BackupImportStatusRunning {
+			return h
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("import history for task %q never reached a terminal status", taskID)
+	return nil
+}
+
+// TestImportHistory_SuccessPersistsTerminalState covers the happy path: the row is
+// created at submit time (running) and finalized to success with the import counts.
+// 成功路径：提交时落库（running），终态回填为 success 并带上导入计数。
+func TestImportHistory_SuccessPersistsTerminalState(t *testing.T) {
+	s, _, _, _, _, _, _ := newImportTestService(t)
+	zipPath := buildNotesOnlyZip(t, t.TempDir())
+
+	task, err := s.SubmitImportBackup(context.Background(), 12, &dto.BackupImportRequest{
+		Vault:        "vault1",
+		IncludeNotes: true,
+		FileName:     "notes.zip",
+	}, zipPath)
+	if err != nil {
+		t.Fatalf("SubmitImportBackup error: %v", err)
+	}
+
+	// Submitted row must exist immediately, before the task has done any work.
+	// 任务开始工作前，提交记录就必须已经存在。
+	submitted := readImportHistory(t, s, task.TaskID)
+	if submitted == nil {
+		t.Fatal("expected an import history row at submit time")
+	}
+	if submitted.Status != domain.BackupImportStatusRunning {
+		t.Fatalf("expected running at submit time, got %d", submitted.Status)
+	}
+	if submitted.FileName != "notes.zip" || submitted.VaultName != "vault1" {
+		t.Fatalf("unexpected submitted row: %+v", submitted)
+	}
+	if submitted.FileSize <= 0 {
+		t.Fatalf("expected file size to be recorded, got %d", submitted.FileSize)
+	}
+
+	waitForPhase(t, s, 12, task.TaskID, importPhaseSuccess)
+	h := waitForTerminalHistory(t, s, task.TaskID)
+	if h.Status != domain.BackupImportStatusSuccess {
+		t.Fatalf("expected success status, got %d", h.Status)
+	}
+	if h.NotesCount != 1 {
+		t.Fatalf("expected notesCount=1, got %d", h.NotesCount)
+	}
+	if h.EndTime.IsZero() || h.DurationMs <= 0 {
+		t.Fatalf("expected end time and duration to be filled, got end=%v duration=%dms", h.EndTime, h.DurationMs)
+	}
+}
+
+// TestImportHistory_CancelPersistsTerminalState verifies that a task cancelled inside
+// runImportTaskInner (three early `return nil` branches) still gets its history
+// finalized — those paths never reach finishImportTask.
+// 验证在 runImportTaskInner 内部取消的任务也会回填历史——这三条分支不会经过 finishImportTask。
+func TestImportHistory_CancelPersistsTerminalState(t *testing.T) {
+	s, _, _, _, _, _, _ := newImportTestService(t)
+	zipPath := buildNotesOnlyZip(t, t.TempDir())
+
+	_, err := s.SubmitImportBackup(context.Background(), 12, &dto.BackupImportRequest{
+		Vault:              "vault1",
+		IncludeNotes:       true,
+		IncludeVaultConfig: true,
+	}, zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	taskID := ""
+	s.importTasks.Range(func(k, v any) bool { taskID = k.(string); return false })
+
+	waitForPhase(t, s, 12, taskID, importPhaseAwaitPartial)
+	if _, err := s.ConfirmImportTask(context.Background(), 12, taskID, false); err != nil {
+		t.Fatalf("ConfirmImportTask error: %v", err)
+	}
+
+	waitForPhase(t, s, 12, taskID, importPhaseCancelled)
+	h := waitForTerminalHistory(t, s, taskID)
+	if h.Status != domain.BackupImportStatusCancelled {
+		t.Fatalf("expected cancelled status, got %d", h.Status)
+	}
+	if h.EndTime.IsZero() {
+		t.Fatal("expected end time to be filled on cancel")
+	}
+}
+
+// TestImportHistory_FailedPersistsTerminalState verifies a failed task records the
+// failure status and the error message.
+// 验证失败任务会记录失败状态与错误信息。
+func TestImportHistory_FailedPersistsTerminalState(t *testing.T) {
+	s, _, _, _, _, _, _ := newImportTestService(t)
+
+	// Not a zip: the task fails during the validating phase.
+	// 非 zip 文件：任务在校验阶段失败。
+	badPath := filepath.Join(t.TempDir(), "broken.zip")
+	if err := os.WriteFile(badPath, []byte("definitely not a zip"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	task, err := s.SubmitImportBackup(context.Background(), 12, &dto.BackupImportRequest{
+		Vault:        "vault1",
+		IncludeNotes: true,
+	}, badPath)
+	if err != nil {
+		t.Fatalf("SubmitImportBackup error: %v", err)
+	}
+
+	waitForPhase(t, s, 12, task.TaskID, importPhaseFailed)
+	h := waitForTerminalHistory(t, s, task.TaskID)
+	if h.Status != domain.BackupImportStatusFailed {
+		t.Fatalf("expected failed status, got %d", h.Status)
+	}
+	if h.Message == "" {
+		t.Fatal("expected the failure message to be persisted")
 	}
 }

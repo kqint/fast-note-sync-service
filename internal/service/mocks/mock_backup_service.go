@@ -88,6 +88,14 @@ func (m *MockBackupService) ConfirmImportTask(ctx context.Context, uid int64, ta
 	return nil, args.Error(1)
 }
 
+func (m *MockBackupService) ListImportHistory(ctx context.Context, uid int64, pager *app.Pager) ([]*dto.BackupImportHistoryDTO, int64, error) {
+	args := m.Called(ctx, uid, pager)
+	if v := args.Get(0); v != nil {
+		return v.([]*dto.BackupImportHistoryDTO), args.Get(1).(int64), args.Error(2)
+	}
+	return nil, args.Get(1).(int64), args.Error(2)
+}
+
 func (m *MockBackupService) Shutdown(ctx context.Context) error {
 	args := m.Called(ctx)
 	return args.Error(0)

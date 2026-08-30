@@ -334,6 +334,57 @@ CREATE INDEX "idx_backup_history_uid" ON "backup_history" ("uid", "created_at" D
 CREATE INDEX "idx_backup_history_config_id" ON "backup_history" ("config_id");
 
 -- ----------------------------
+-- Table structure for backup_import_history
+-- 备份包导入历史（与 backup_history 相互独立：一个是导出/同步，一个是导入）
+-- ----------------------------
+DROP TABLE IF EXISTS "backup_import_history";
+
+CREATE TABLE "backup_import_history" (
+    "id" integer PRIMARY KEY AUTOINCREMENT,
+    "uid" integer NOT NULL DEFAULT 0,
+    "task_id" text DEFAULT '',
+    -- 内存态导入任务 ID，用于日志与数据库记录互相定位
+    "vault_name" text DEFAULT '',
+    -- 目标仓库名称
+    "file_name" text DEFAULT '',
+    -- 上传的原始备份包名
+    "file_size" integer DEFAULT 0,
+    -- bytes
+    "status" integer DEFAULT 0,
+    -- 0: Running, 1: Success, 2: Failed, 3: Cancelled, 4: Stopped (服务重启导致中断)
+    "start_time" datetime DEFAULT NULL,
+    "end_time" datetime DEFAULT NULL,
+    "duration_ms" integer DEFAULT 0,
+    -- end_time - start_time，毫秒；未结束时为 0
+    "include_notes" integer DEFAULT 0,
+    -- 提交时勾选：导入笔记和附件
+    "include_vault_config" integer DEFAULT 0,
+    -- 提交时勾选：导入仓库配置 (.obsidian)
+    "include_note_history" integer DEFAULT 0,
+    -- 提交时勾选：导入笔记历史
+    "allow_partial" integer DEFAULT 0,
+    -- 提交时勾选：允许仅导入备份包中实际存在的部分
+    "notes_count" integer DEFAULT 0,
+    -- 导入(覆盖)的笔记数
+    "files_count" integer DEFAULT 0,
+    -- 导入(覆盖)的附件数
+    "settings_count" integer DEFAULT 0,
+    -- 导入(覆盖)的仓库配置数
+    "note_history_count" integer DEFAULT 0,
+    -- 导入的笔记历史条数
+    "skipped_history_count" integer DEFAULT 0,
+    -- 跳过的笔记历史条数 (对应笔记不存在)
+    "message" text DEFAULT '',
+    -- 失败时的错误信息；其余状态为空或简要说明
+    "created_at" datetime DEFAULT NULL,
+    "updated_at" datetime DEFAULT NULL
+);
+
+CREATE INDEX "idx_backup_import_history_uid" ON "backup_import_history" ("uid", "created_at" DESC);
+
+CREATE INDEX "idx_backup_import_history_task_id" ON "backup_import_history" ("task_id");
+
+-- ----------------------------
 -- Table structure for git_sync_config
 -- ----------------------------
 DROP TABLE IF EXISTS "git_sync_config";
