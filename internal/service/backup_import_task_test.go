@@ -254,6 +254,57 @@ func TestImportTaskLifecycle_AwaitTimeout(t *testing.T) {
 	}
 }
 
+// TestConfirmImportTask_ResponseAdvancesPhase locks the regression behind the
+// duplicated partial-import dialog: ConfirmImportTask used to snapshot the task
+// right after writing to confirmCh, but the goroutine only flips the phase once
+// it reads from that channel — after the response was already serialized. The
+// caller therefore received a stale await_partial and re-opened the dialog the
+// user had just answered.
+// 防止「部分导入弹窗弹两次」回归：ConfirmImportTask 曾在写入 confirmCh 后立即快照，
+// 而 goroutine 要等从 channel 读到值才切换阶段——那时响应早已序列化发出。调用方
+// 因此收到陈旧的 await_partial，把用户刚回答过的弹窗又弹了一次。
+func TestConfirmImportTask_ResponseAdvancesPhase(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		allowPartial bool
+		wantPhase    string
+	}{
+		{name: "confirm partial import", allowPartial: true, wantPhase: importPhaseImporting},
+		{name: "decline partial import", allowPartial: false, wantPhase: importPhaseCancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, _, _, _, _ := newImportTestService(t)
+			zipPath := buildNotesOnlyZip(t, t.TempDir())
+
+			if _, err := s.SubmitImportBackup(context.Background(), 12, &dto.BackupImportRequest{
+				Vault:              "vault1",
+				IncludeNotes:       true,
+				IncludeVaultConfig: true,
+			}, zipPath); err != nil {
+				t.Fatalf("SubmitImportBackup error: %v", err)
+			}
+
+			taskID := ""
+			s.importTasks.Range(func(k, v any) bool { taskID = k.(string); return false })
+			waitForPhase(t, s, 12, taskID, importPhaseAwaitPartial)
+
+			st, err := s.ConfirmImportTask(context.Background(), 12, taskID, tc.allowPartial)
+			if err != nil {
+				t.Fatalf("ConfirmImportTask error: %v", err)
+			}
+			// The whole point: the answer must never echo back await_partial.
+			// 关键点：响应绝不能把 await_partial 原样回显。
+			if st.Phase == importPhaseAwaitPartial {
+				t.Fatalf("confirm response must not report a stale await_partial")
+			}
+			if st.Phase != tc.wantPhase {
+				t.Fatalf("expected phase %s after confirm(allowPartial=%v), got %s",
+					tc.wantPhase, tc.allowPartial, st.Phase)
+			}
+		})
+	}
+}
+
 // TestImportTask_UnknownTask: unknown task id returns 549.
 // 未知任务 ID → 549。
 func TestImportTask_UnknownTask(t *testing.T) {

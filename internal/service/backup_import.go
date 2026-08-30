@@ -318,6 +318,26 @@ func (s *backupService) ConfirmImportTask(ctx context.Context, uid int64, taskID
 	default:
 		return task.snapshot(), code.ErrorBackupImportTaskNotFound
 	}
+
+	// The goroutine flips the phase only after it reads from confirmCh, which is
+	// after this response has already been serialized. Advance it here so the
+	// caller never observes a stale await_partial: returning the old phase made
+	// the webgui re-open the very dialog the user had just answered, and the
+	// second click then hit "task not found" (549) because the phase had moved on.
+	// goroutine 只有在从 confirmCh 读到值之后才会切换阶段，而那时本响应已经序列化发出。
+	// 这里同步推进阶段，调用方就不会看到陈旧的 await_partial：返回旧阶段会让 webgui
+	// 把用户刚刚回答过的确认弹窗再弹一次，而第二次点击又会因为阶段已推进而撞上 549。
+	task.mu.Lock()
+	if task.phase == importPhaseAwaitPartial {
+		if allowPartial {
+			task.phase = importPhaseImporting
+		} else {
+			task.phase = importPhaseCancelled
+			task.finishedAt = time.Now()
+		}
+	}
+	task.mu.Unlock()
+
 	return task.snapshot(), nil
 }
 
