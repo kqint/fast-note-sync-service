@@ -41,8 +41,13 @@ type AppSettings struct {
 	HistorySaveDelay string `yaml:"history-save-delay" default:"10s"`
 	// BackupImportSizeLimitEnabled toggles the backup import archive size limit; default false
 	// (unlimited). Modifiable at runtime via system settings (POST /api/admin/config).
+	// Scope: applies only to note backup archive (ZIP) imports (POST /api/backup/import).
+	// Config imports (POST /api/admin/config/import) are NOT affected by this limit —
+	// they enforce their own fixed, non-configurable 2MB cap.
 	// 备份导入文件大小限制开关，默认关闭（不限制）。
 	// 可在系统设置中修改（POST /api/admin/config），修改后热生效。
+	// 作用范围：仅作用于笔记备份包（ZIP）导入（POST /api/backup/import）。
+	// 设置导入（POST /api/admin/config/import）不受此限制影响，其自身有固定且不可配置的 2MB 上限。
 	BackupImportSizeLimitEnabled *bool `yaml:"backup-import-size-limit-enabled" default:"false"`
 	// BackupImportSizeLimit max backup import archive size, e.g. "512MB", "2GB"; default 2GB.
 	// Only takes effect when BackupImportSizeLimitEnabled is true.
@@ -143,6 +148,7 @@ func clampWindow(v, max int) int {
 // BackupImportSizeLimitResolved 从设置实时解析备份导入大小限制，返回 (是否启用, 上限字节数)。
 // 默认关闭；启用时缺失/非法配置回退 DefaultBackupImportSizeLimitBytes。
 // 实时读取（非构造期快照）使系统设置的修改对下一次导入提交立即生效。
+// 注意：该限制仅用于笔记备份包（ZIP）导入，设置导入不调用本方法（另有固定 2MB 上限）。
 func (a AppSettings) BackupImportSizeLimitResolved() (bool, int64) {
 	if a.BackupImportSizeLimitEnabled == nil || !*a.BackupImportSizeLimitEnabled {
 		return false, 0
