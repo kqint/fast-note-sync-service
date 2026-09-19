@@ -435,6 +435,12 @@ func (s *backupService) runImportTaskInner(task *backupImportTask) error {
 	}
 
 	notePaths, filePaths, settingPaths := classifyArchiveFiles(extractDir)
+	// Exact per-entry timestamps ride in a private extra field. Archives written
+	// without it simply yield an empty map and import falls back to the ZIP
+	// entry timestamps.
+	// 精确的逐条目时间戳通过私有 extra 字段携带。未携带该字段的归档只会得到空 map，
+	// 导入回退到 ZIP 条目时间。
+	entryTimes := s.readArchiveEntryTimes(task.zipPath)
 	historyCount := countBackupHistoryEntries(extractDir)
 	available := dto.BackupImportAvailabilityDTO{
 		Notes:       len(notePaths)+len(filePaths) > 0,
@@ -535,13 +541,13 @@ func (s *backupService) runImportTaskInner(task *backupImportTask) error {
 	result := &dto.BackupImportResultDTO{Vault: vault.Name}
 
 	if req.IncludeNotes {
-		result.Notes, result.Files, err = s.importNotesAndAttachments(ctx, uid, vault.ID, extractDir, notePaths, filePaths, task)
+		result.Notes, result.Files, err = s.importNotesAndAttachments(ctx, uid, vault.ID, extractDir, notePaths, filePaths, entryTimes, task)
 		if err != nil {
 			return err
 		}
 	}
 	if req.IncludeVaultConfig {
-		result.Settings, err = s.importVaultSettings(ctx, uid, vault.ID, extractDir, settingPaths, task)
+		result.Settings, err = s.importVaultSettings(ctx, uid, vault.ID, extractDir, settingPaths, entryTimes, task)
 		if err != nil {
 			return err
 		}
@@ -622,9 +628,15 @@ func (p *importProgress) add(notes, files, settings, history, skipped int64) {
 	}
 }
 
-// Note: archives carry no manifest, and import validation derives section
+// Note: archives carry no section index, and import validation derives section
 // availability by scanning the extracted files directly (classifyArchiveFiles).
-// 说明：归档不携带清单文件，导入端通过直接扫描解压文件确定各部分可用性（见 classifyArchiveFiles）。
+// The only file under the reserved ".fns/" directory is the note history data,
+// which never counts as user content. Resource timestamps are not a file at all
+// — they ride in a private per-entry extra field (see util.EntryTimes).
+// 说明：归档不携带章节索引，导入端通过直接扫描解压文件确定各部分可用性
+// （见 classifyArchiveFiles）。保留目录 ".fns/" 下只有笔记历史数据，它从不计入用户
+// 内容。资源时间戳根本不占文件——它们通过私有逐条目 extra 字段携带
+// （见 util.EntryTimes）。
 
 // countBackupHistoryEntries streams the archived note history data file
 // (.fns/note_history.json) once to count entries without loading full payloads.
@@ -736,10 +748,82 @@ func classifyArchiveFiles(extractDir string) (notes, files []string, settings []
 	return
 }
 
+// extractedMtimeMs returns the modification time (millisecond epoch) of a file
+// extracted from the archive. util.UnzipWithPassword restores each entry's
+// timestamp, so this yields the resource's original mtime rather than the
+// extraction time. Falls back to fallback when the file cannot be stat'ed or
+// the timestamp is unusable.
+//
+// 返回从归档解压出的文件的修改时间（毫秒时间戳）。util.UnzipWithPassword 会还原
+// 条目时间戳，因此这里拿到的是资源原始修改时间，而非解压时刻。stat 失败或时间
+// 不可用时回退到 fallback。
+func extractedMtimeMs(path string, fallback int64) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fallback
+	}
+	if ms := info.ModTime().UnixMilli(); ms > 0 {
+		return ms
+	}
+	return fallback
+}
+
+// readArchiveEntryTimes reads the exact per-entry timestamps embedded by
+// util.ZipWithPassword from the archive's central directory, keyed by entry name.
+//
+// Failure is never fatal: an unreadable archive, or one written without the
+// private extra field, yields nil and import simply falls back to the
+// timestamps restored from the ZIP entries.
+//
+// readArchiveEntryTimes 从归档中央目录读取由 util.ZipWithPassword 写入的精确
+// 逐条目时间戳，键为条目名。
+//
+// 失败绝不致命：归档不可读、或未携带该私有 extra 字段时返回 nil，导入直接回退到
+// ZIP 条目还原出的时间。
+func (s *backupService) readArchiveEntryTimes(zipPath string) map[string]util.EntryTimes {
+	times, err := util.ReadEntryTimes(zipPath)
+	if err != nil {
+		s.logger.Warn("Falling back to ZIP entry timestamps",
+			zap.String("zipPath", zipPath), zap.Error(err))
+		return nil
+	}
+	return times
+}
+
+// resolveResourceTimes decides which timestamps to store for one imported
+// resource.
+//
+// The embedded entry times win when present: they carry the exact mtime (the ZIP
+// MS-DOS field is truncated to 2 seconds) plus the ctime that a ZIP header
+// cannot express at all. Otherwise the mtime restored from the ZIP entry is used
+// and ctime falls back to fallbackMs, since the archive simply has no creation
+// time to restore.
+//
+// resolveResourceTimes 决定单个导入资源应写入的时间戳。
+//
+// 归档内嵌的条目时间存在时以其为准：它带有精确的 mtime（ZIP 的 MS-DOS 字段被截断到
+// 2 秒）以及 ZIP 头完全无法表达的 ctime。否则使用 ZIP 条目还原出的 mtime，
+// ctime 回落到 fallbackMs——归档里确实没有创建时间可还原。
+func resolveResourceTimes(entryTimes map[string]util.EntryTimes, relPath, extractedPath string, fallbackMs int64) (mtimeMs, ctimeMs int64) {
+	if e, ok := entryTimes[relPath]; ok && (e.Ctime > 0 || e.Mtime > 0) {
+		mtimeMs, ctimeMs = e.Mtime, e.Ctime
+		if mtimeMs <= 0 {
+			mtimeMs = extractedMtimeMs(extractedPath, fallbackMs)
+		}
+		if ctimeMs <= 0 {
+			ctimeMs = mtimeMs
+		}
+		return mtimeMs, ctimeMs
+	}
+
+	mtimeMs = extractedMtimeMs(extractedPath, fallbackMs)
+	return mtimeMs, fallbackMs
+}
+
 // importNotesAndAttachments upserts notes (*.md) and attachments with an
 // overwrite strategy, then rebuilds folder FIDs and vault statistics.
 // 以覆盖策略更新或创建笔记 (*.md) 与附件，随后重建文件夹 FID 与仓库统计。
-func (s *backupService) importNotesAndAttachments(ctx context.Context, uid, vaultID int64, extractDir string, notePaths, filePaths []string, task *backupImportTask) (int64, int64, error) {
+func (s *backupService) importNotesAndAttachments(ctx context.Context, uid, vaultID int64, extractDir string, notePaths, filePaths []string, entryTimes map[string]util.EntryTimes, task *backupImportTask) (int64, int64, error) {
 	nowMs := timex.Now().UnixMilli()
 	var importedNotes, importedFiles int64
 	progress := &importProgress{service: s, task: task}
@@ -748,12 +832,17 @@ func (s *backupService) importNotesAndAttachments(ctx context.Context, uid, vaul
 		if ctx.Err() != nil {
 			return importedNotes, importedFiles, ctx.Err()
 		}
-		content, err := os.ReadFile(filepath.Join(extractDir, filepath.FromSlash(relPath)))
+		notePath := filepath.Join(extractDir, filepath.FromSlash(relPath))
+		content, err := os.ReadFile(notePath)
 		if err != nil {
 			s.logger.Warn("Skipping unreadable note in backup import",
 				zap.String("path", relPath), zap.Error(err))
 			continue
 		}
+		// Keep the note's original timestamps instead of stamping them with the
+		// import time.
+		// 保留笔记原始时间戳，而不是写入导入时刻。
+		mtimeMs, ctimeMs := resolveResourceTimes(entryTimes, relPath, notePath, nowMs)
 
 		pathHash := util.EncodeHash32(relPath)
 		contentStr := string(content)
@@ -770,7 +859,8 @@ func (s *backupService) importNotesAndAttachments(ctx context.Context, uid, vaul
 			existing.Content = contentStr
 			existing.ContentHash = util.EncodeHash32(contentStr)
 			existing.Size = int64(len(content))
-			existing.Mtime = nowMs
+			existing.Mtime = mtimeMs
+			existing.Ctime = ctimeMs
 			existing.Action = action
 			existing.Rename = 0
 			existing.Version++
@@ -787,8 +877,8 @@ func (s *backupService) importNotesAndAttachments(ctx context.Context, uid, vaul
 				Content:     contentStr,
 				ContentHash: util.EncodeHash32(contentStr),
 				Size:        int64(len(content)),
-				Mtime:       nowMs,
-				Ctime:       nowMs,
+				Mtime:       mtimeMs,
+				Ctime:       ctimeMs,
 				Action:      domain.NoteActionCreate,
 			}
 			if _, err := s.noteRepo.Create(ctx, newNote, uid); err != nil {
@@ -817,6 +907,10 @@ func (s *backupService) importNotesAndAttachments(ctx context.Context, uid, vaul
 				zap.String("path", relPath), zap.Error(statErr))
 			continue
 		}
+		// Keep the attachment's original timestamps instead of stamping them
+		// with the import time.
+		// 保留附件原始时间戳，而不是写入导入时刻。
+		mtimeMs, ctimeMs := resolveResourceTimes(entryTimes, relPath, srcPath, nowMs)
 
 		tempPath, err := stageAttachmentFile(fileStorageDir, srcPath)
 		if err != nil {
@@ -845,7 +939,8 @@ func (s *backupService) importNotesAndAttachments(ctx context.Context, uid, vaul
 			existing.ContentHash = contentHash
 			existing.SavePath = tempPath
 			existing.Size = info.Size()
-			existing.Mtime = nowMs
+			existing.Mtime = mtimeMs
+			existing.Ctime = ctimeMs
 			existing.Action = action
 			existing.Rename = 0
 			if _, err := s.fileRepo.Update(ctx, existing, uid); err != nil {
@@ -862,8 +957,8 @@ func (s *backupService) importNotesAndAttachments(ctx context.Context, uid, vaul
 				ContentHash: contentHash,
 				SavePath:    tempPath,
 				Size:        info.Size(),
-				Mtime:       nowMs,
-				Ctime:       nowMs,
+				Mtime:       mtimeMs,
+				Ctime:       ctimeMs,
 				Action:      domain.FileActionCreate,
 			}
 			if _, err := s.fileRepo.Create(ctx, newFile, uid); err != nil {
@@ -929,12 +1024,18 @@ func stageAttachmentFile(fileStorageDir, srcPath string) (string, error) {
 		os.Remove(tmpName)
 		return "", err
 	}
+	// Carry the source mtime onto the staged file so the renamed file.dat keeps
+	// the attachment's original timestamp.
+	// 把源文件 mtime 带到暂存文件上，使其重命名落位为 file.dat 后仍保留原始时间。
+	if info, err := src.Stat(); err == nil {
+		_ = os.Chtimes(tmpName, info.ModTime(), info.ModTime())
+	}
 	return tmpName, nil
 }
 
 // importVaultSettings upserts .obsidian config records with an overwrite strategy.
 // 以覆盖策略更新或创建 .obsidian 配置记录。
-func (s *backupService) importVaultSettings(ctx context.Context, uid, vaultID int64, extractDir string, settingPaths []string, task *backupImportTask) (int64, error) {
+func (s *backupService) importVaultSettings(ctx context.Context, uid, vaultID int64, extractDir string, settingPaths []string, entryTimes map[string]util.EntryTimes, task *backupImportTask) (int64, error) {
 	nowMs := timex.Now().UnixMilli()
 	var count int64
 	progress := &importProgress{service: s, task: task}
@@ -943,12 +1044,17 @@ func (s *backupService) importVaultSettings(ctx context.Context, uid, vaultID in
 		if ctx.Err() != nil {
 			return count, ctx.Err()
 		}
-		content, err := os.ReadFile(filepath.Join(extractDir, filepath.FromSlash(relPath)))
+		settingPath := filepath.Join(extractDir, filepath.FromSlash(relPath))
+		content, err := os.ReadFile(settingPath)
 		if err != nil {
 			s.logger.Warn("Skipping unreadable vault config in backup import",
 				zap.String("path", relPath), zap.Error(err))
 			continue
 		}
+		// Keep the vault config's original timestamps instead of stamping them
+		// with the import time.
+		// 保留仓库配置原始时间戳，而不是写入导入时刻。
+		mtimeMs, ctimeMs := resolveResourceTimes(entryTimes, relPath, settingPath, nowMs)
 
 		pathHash := util.EncodeHash32(relPath)
 		contentStr := string(content)
@@ -966,7 +1072,8 @@ func (s *backupService) importVaultSettings(ctx context.Context, uid, vaultID in
 			existing.Content = contentStr
 			existing.ContentHash = util.EncodeHash32(contentStr)
 			existing.Size = int64(len(content))
-			existing.Mtime = nowMs
+			existing.Mtime = mtimeMs
+			existing.Ctime = ctimeMs
 			existing.Rename = 0
 			if _, err := s.settingRepo.Update(ctx, existing, uid); err != nil {
 				return count, code.ErrorDBQuery.WithDetails(err.Error())
@@ -982,8 +1089,8 @@ func (s *backupService) importVaultSettings(ctx context.Context, uid, vaultID in
 				Content:     contentStr,
 				ContentHash: util.EncodeHash32(contentStr),
 				Size:        int64(len(content)),
-				Ctime:       nowMs,
-				Mtime:       nowMs,
+				Ctime:       ctimeMs,
+				Mtime:       mtimeMs,
 			}
 			if _, err := s.settingRepo.Create(ctx, newSetting, uid); err != nil {
 				return count, code.ErrorDBQuery.WithDetails(err.Error())

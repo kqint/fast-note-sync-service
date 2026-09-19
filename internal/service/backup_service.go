@@ -763,7 +763,7 @@ func (s *backupService) runArchive(ctx context.Context, config *domain.BackupCon
 
 	// 1. Collect resources (includes notes and attachments)
 	// 1. 收集资源 (包含笔记和附件)
-	count, size, err := s.exportArchiveFiles(ctx, uid, config.VaultID, tempDir, config.Type == "incremental", lastRun)
+	count, size, entryTimes, err := s.exportArchiveFiles(ctx, uid, config.VaultID, tempDir, config.Type == "incremental", lastRun)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -783,7 +783,11 @@ func (s *backupService) runArchive(ctx context.Context, config *domain.BackupCon
 		password = util.GetRandomString(12)
 	}
 
-	if err := util.ZipWithPassword(tempDir, zipPath, password); err != nil {
+	// The per-entry timestamps ride along in a private extra field: ZIP headers
+	// cannot hold creation time, and truncate the modification time to 2 seconds.
+	// 逐条目时间戳通过私有 extra 字段随归档一起写出：ZIP 头装不下创建时间，
+	// 且会把修改时间截断到 2 秒。
+	if err := util.ZipWithPassword(tempDir, zipPath, password, util.WithEntryTimes(entryTimes)); err != nil {
 		return 0, 0, err
 	}
 
@@ -953,23 +957,29 @@ func (s *backupService) finishTask(ctx context.Context, config *domain.BackupCon
 // Includes notes, attachments, vault config (.obsidian) and (for full backups) note history
 // 将需要备份的文件导出到临时目录，用于后续打包
 // 包含笔记、附件、仓库配置 (.obsidian)，全量备份时额外包含笔记历史
-func (s *backupService) exportArchiveFiles(ctx context.Context, uid, vaultID int64, targetDir string, incremental bool, lastRun time.Time) (int64, int64, error) {
+func (s *backupService) exportArchiveFiles(ctx context.Context, uid, vaultID int64, targetDir string, incremental bool, lastRun time.Time) (int64, int64, map[string]util.EntryTimes, error) {
 	if vaultID <= 0 {
-		return 0, 0, code.ErrorBackupVaultRequired
+		return 0, 0, nil, code.ErrorBackupVaultRequired
 	}
 
 	vault, err := s.vaultRepo.GetByID(ctx, vaultID, uid)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 	if vault == nil {
-		return 0, 0, code.ErrorVaultNotFound
+		return 0, 0, nil, code.ErrorVaultNotFound
 	}
 
 	totalCount := int64(0)
 	totalSize := int64(0)
+	// ZIP headers cannot express creation time and truncate the modification time
+	// to 2 seconds, so the exact values travel in a per-entry extra field rather
+	// than in a separate archive member.
+	// ZIP 头无法表达创建时间、且把修改时间截断到 2 秒，因此精确值通过逐条目的 extra
+	// 字段携带，而不是另加一个归档成员。
+	entryTimes := make(map[string]util.EntryTimes)
 
-	err = s.forEachResource(ctx, uid, vault, incremental, lastRun, func(v *domain.Vault, path string, isNote bool, content []byte, localSize int64, localPath string, mtime time.Time, isDeleted bool) error {
+	err = s.forEachResource(ctx, uid, vault, incremental, lastRun, func(v *domain.Vault, path string, isNote bool, content []byte, localSize int64, localPath string, mtime, ctime time.Time, isDeleted bool) error {
 		if isDeleted {
 			return nil
 		}
@@ -997,20 +1007,24 @@ func (s *backupService) exportArchiveFiles(ctx context.Context, uid, vaultID int
 				return err
 			}
 		}
+		s.applySourceMtime(destPath, path, mtime)
+		if t := newEntryTimes(ctime, mtime); t != (util.EntryTimes{}) {
+			entryTimes[filepath.ToSlash(path)] = t
+		}
 		totalCount++
 		totalSize += localSize
 		return nil
 	})
 
 	if err != nil {
-		return totalCount, totalSize, err
+		return totalCount, totalSize, entryTimes, err
 	}
 
 	// Export vault config (.obsidian settings) — included in every archive backup
 	// 导出仓库配置 (.obsidian 配置文件) — 所有归档备份均包含
-	if _, err := s.exportVaultSettings(ctx, uid, vault, targetDir); err != nil {
+	if _, err := s.exportVaultSettings(ctx, uid, vault, targetDir, entryTimes); err != nil {
 		s.logger.Warn("Failed to export vault config for backup", zap.Error(err))
-		return totalCount, totalSize, err
+		return totalCount, totalSize, entryTimes, err
 	}
 
 	// Export note history — full backups only, incremental runs keep the
@@ -1019,17 +1033,39 @@ func (s *backupService) exportArchiveFiles(ctx context.Context, uid, vaultID int
 	if !incremental {
 		if _, err := s.exportNoteHistory(ctx, uid, vault.ID, targetDir); err != nil {
 			s.logger.Warn("Failed to export note history for backup", zap.Error(err))
-			return totalCount, totalSize, err
+			return totalCount, totalSize, entryTimes, err
 		}
 	}
 
-	return totalCount, totalSize, nil
+	return totalCount, totalSize, entryTimes, nil
+}
+
+// newEntryTimes converts the database's millisecond epochs into the archive's
+// per-entry timestamp record. A time the client never reported stays 0, and an
+// entry with neither time is omitted from the archive entirely.
+// newEntryTimes 把数据库的毫秒时间戳转成归档的逐条目时间记录。客户端从未上报的时间
+// 保持 0；两个时间都为空的条目会从归档中完全省略。
+func newEntryTimes(ctime, mtime time.Time) util.EntryTimes {
+	return util.EntryTimes{Ctime: msOrZero(ctime), Mtime: msOrZero(mtime)}
+}
+
+// msOrZero converts a time to a millisecond epoch, mapping the zero time (and
+// any pre-1970 value) to 0 so the archive can omit it.
+// msOrZero 将时间转为毫秒时间戳；零值时间（以及 1970 之前的值）统一返回 0，
+// 便于归档省略。
+func msOrZero(t time.Time) int64 {
+	if ms := t.UnixMilli(); ms > 0 {
+		return ms
+	}
+	return 0
 }
 
 // exportVaultSettings exports all non-deleted vault config records (.obsidian files)
-// into the staging directory at their original paths.
-// 将所有未删除的仓库配置记录 (.obsidian 文件) 按原始路径导出到暂存目录。
-func (s *backupService) exportVaultSettings(ctx context.Context, uid int64, vault *domain.Vault, targetDir string) (int64, error) {
+// into the staging directory at their original paths, recording each one's exact
+// timestamps into entryTimes.
+// 将所有未删除的仓库配置记录 (.obsidian 文件) 按原始路径导出到暂存目录，
+// 并把各自精确的时间戳记入 entryTimes。
+func (s *backupService) exportVaultSettings(ctx context.Context, uid int64, vault *domain.Vault, targetDir string, entryTimes map[string]util.EntryTimes) (int64, error) {
 	settings, err := s.settingRepo.List(ctx, vault.ID, 1, 1000000, uid, "")
 	if err != nil {
 		return 0, err
@@ -1054,9 +1090,39 @@ func (s *backupService) exportVaultSettings(ctx context.Context, uid int64, vaul
 		if err := os.WriteFile(destPath, []byte(st.Content), 0644); err != nil {
 			return count, err
 		}
+		s.applySourceMtime(destPath, st.Path, time.UnixMilli(st.Mtime))
+		if t := newEntryTimes(time.UnixMilli(st.Ctime), time.UnixMilli(st.Mtime)); t != (util.EntryTimes{}) {
+			entryTimes[filepath.ToSlash(cleanPath)] = t
+		}
 		count++
 	}
 	return count, nil
+}
+
+// applySourceMtime stamps a staging file with the resource's original
+// modification time. Without it the staging file carries the backup run time,
+// and util.ZipWithPassword — which derives each entry's timestamp from
+// zip.FileInfoHeader — would record the backup time in the archive instead of
+// the source modification time.
+//
+// mtime comes from the database (millisecond epoch); a non-positive value means
+// "unknown" and is skipped. Failures are logged but not fatal: losing a
+// timestamp must not abort an otherwise valid backup.
+//
+// 用资源原始修改时间标记暂存文件。若不设置，暂存文件带的是备份执行时间，而
+// util.ZipWithPassword 通过 zip.FileInfoHeader 取条目时间，归档里记录的就会是
+// 备份时间而非源文件修改时间。
+//
+// mtime 来自数据库（毫秒时间戳），非正值表示未知、跳过。设置失败只记日志不中断：
+// 时间戳丢失不应让一次本来可用的备份整体失败。
+func (s *backupService) applySourceMtime(destPath, path string, mtime time.Time) {
+	if mtime.UnixMilli() <= 0 {
+		return
+	}
+	if err := os.Chtimes(destPath, mtime, mtime); err != nil {
+		s.logger.Warn("Failed to preserve source mtime in backup staging",
+			zap.String("path", path), zap.Error(err))
+	}
 }
 
 // exportNoteHistory exports all note history records of a vault as a single JSON
@@ -1224,7 +1290,9 @@ func (s *backupService) syncFiles(ctx context.Context, uid, vaultID, configId in
 	failedCount := int64(0)
 	var lastSendErr error
 	hasChanges := false
-	err = s.forEachResource(ctx, uid, vault, !lastRun.IsZero(), lastRun, func(v *domain.Vault, path string, isNote bool, content []byte, localSize int64, localPath string, mtime time.Time, isDeleted bool) error {
+	// Storage backends only accept a modification time, so ctime is ignored here.
+	// 存储后端只接受修改时间，这里忽略 ctime。
+	err = s.forEachResource(ctx, uid, vault, !lastRun.IsZero(), lastRun, func(v *domain.Vault, path string, isNote bool, content []byte, localSize int64, localPath string, mtime, _ time.Time, isDeleted bool) error {
 		hasChanges = true
 		if client == nil {
 			return nil // Just checking for changes // 仅检查变更
@@ -1292,7 +1360,12 @@ func (s *backupService) syncFiles(ctx context.Context, uid, vaultID, configId in
 	return hasChanges, nil
 }
 
-type resourceAction func(v *domain.Vault, path string, isNote bool, content []byte, localSize int64, localPath string, mtime time.Time, isDeleted bool) error // resourceAction 定义资源处理动作 // resourceAction defines resource processing action
+// resourceAction defines the per-resource callback used by forEachResource.
+// mtime/ctime come from the database and may be zero when the client never
+// reported them.
+// resourceAction 定义 forEachResource 的逐资源回调。mtime/ctime 来自数据库，
+// 客户端未上报时可能为零值。
+type resourceAction func(v *domain.Vault, path string, isNote bool, content []byte, localSize int64, localPath string, mtime, ctime time.Time, isDeleted bool) error
 
 // forEachResource Iterate through all resources (notes and attachments) in the specified vault
 // 遍历指定 Vault 中的所有资源 (笔记和附件)
@@ -1325,7 +1398,7 @@ func (s *backupService) forEachResource(ctx context.Context, uid int64, v *domai
 		if filepath.Ext(path) != ".md" {
 			path += ".md"
 		}
-		if err := action(v, path, true, []byte(n.Content), int64(len(n.Content)), "", time.UnixMilli(n.Mtime), n.IsDeleted()); err != nil {
+		if err := action(v, path, true, []byte(n.Content), int64(len(n.Content)), "", time.UnixMilli(n.Mtime), time.UnixMilli(n.Ctime), n.IsDeleted()); err != nil {
 			return err
 		}
 	}
@@ -1353,7 +1426,7 @@ func (s *backupService) forEachResource(ctx context.Context, uid int64, v *domai
 				size = info.Size()
 			}
 		}
-		if err := action(v, f.Path, false, nil, size, f.SavePath, time.UnixMilli(f.Mtime), f.IsDeleted()); err != nil {
+		if err := action(v, f.Path, false, nil, size, f.SavePath, time.UnixMilli(f.Mtime), time.UnixMilli(f.Ctime), f.IsDeleted()); err != nil {
 			return err
 		}
 	}

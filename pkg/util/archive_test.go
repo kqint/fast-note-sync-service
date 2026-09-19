@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -49,6 +50,56 @@ func TestZipUnzipRoundTripWithPassword(t *testing.T) {
 	}
 	if string(gotCfg) != "{\"a\":1}" {
 		t.Fatalf("config content mismatch: %q", string(gotCfg))
+	}
+}
+
+// An archive must carry the source file's modification time rather than the
+// time it was packed: full/incremental backups are only useful for restore when
+// the original timestamps survive the round trip.
+// 归档必须携带源文件的修改时间而非打包时刻：只有原始时间戳能往返，全量/增量备份
+// 对恢复才有意义。
+func TestZipUnzipRoundTripPreservesModTime(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	if err := os.MkdirAll(filepath.Join(srcDir, "attachments"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fixed instant in the past, truncated to an even second because the ZIP
+	// MS-DOS timestamp format only has 2s resolution.
+	// 一个固定的过去时刻，截断到偶数秒——ZIP 的 MS-DOS 时间格式只有 2 秒精度。
+	want := time.Date(2021, 3, 4, 5, 6, 8, 0, time.UTC)
+
+	relPaths := []string{"note.md", filepath.Join("attachments", "a.bin")}
+	for _, rel := range relPaths {
+		p := filepath.Join(srcDir, rel)
+		if err := os.WriteFile(p, []byte("payload"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, want, want); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	zipPath := filepath.Join(dir, "backup.zip")
+	if err := ZipWithPassword(srcDir, zipPath, ""); err != nil {
+		t.Fatalf("ZipWithPassword() error = %v", err)
+	}
+
+	outDir := filepath.Join(dir, "out")
+	if err := UnzipWithPassword(zipPath, outDir, ""); err != nil {
+		t.Fatalf("UnzipWithPassword() error = %v", err)
+	}
+
+	for _, rel := range relPaths {
+		info, err := os.Stat(filepath.Join(outDir, rel))
+		if err != nil {
+			t.Fatalf("stat %s: %v", rel, err)
+		}
+		if diff := info.ModTime().Sub(want); diff > 2*time.Second || diff < -2*time.Second {
+			t.Errorf("%s mtime = %v, want ~%v (diff %v)",
+				rel, info.ModTime().UTC(), want, diff)
+		}
 	}
 }
 
@@ -181,5 +232,139 @@ func TestUnzipWithPassword_Bzip2Zstd(t *testing.T) {
 				t.Fatalf("content mismatch: %q", string(got))
 			}
 		})
+	}
+}
+
+// The private extra field is how creation time survives at all: ZIP's standard
+// headers cannot hold it, and truncate the modification time to 2 seconds. The
+// timestamps here deliberately carry milliseconds so an exact match proves the
+// extra field won over the MS-DOS fields.
+//
+// 私有 extra 字段是创建时间得以保留的唯一途径：ZIP 标准头装不下它，且会把修改时间
+// 截断到 2 秒。这里的时间刻意带毫秒，精确匹配才能证明 extra 字段胜过 MS-DOS 字段。
+func TestZipWithEntryTimesRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	if err := os.MkdirAll(filepath.Join(srcDir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"a.md", "sub/b.bin"}
+	for _, rel := range names {
+		if err := os.WriteFile(filepath.Join(srcDir, filepath.FromSlash(rel)), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctime := time.Date(2019, 8, 7, 6, 5, 4, 321_000_000, time.UTC)
+	mtime := time.Date(2022, 1, 2, 3, 4, 5, 678_000_000, time.UTC)
+	want := make(map[string]EntryTimes, len(names))
+	for _, name := range names {
+		want[name] = EntryTimes{Ctime: ctime.UnixMilli(), Mtime: mtime.UnixMilli()}
+	}
+
+	zipPath := filepath.Join(dir, "backup.zip")
+	if err := ZipWithPassword(srcDir, zipPath, "pw", WithEntryTimes(want)); err != nil {
+		t.Fatalf("ZipWithPassword() error = %v", err)
+	}
+
+	got, err := ReadEntryTimes(zipPath)
+	if err != nil {
+		t.Fatalf("ReadEntryTimes() error = %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ReadEntryTimes() returned %d entries, want %d", len(got), len(want))
+	}
+	for name, w := range want {
+		if got[name] != w {
+			t.Errorf("%s = %+v, want %+v", name, got[name], w)
+		}
+	}
+
+	// Extraction must stamp the exact mtime onto the extracted file.
+	// 解压必须把精确 mtime 打到解压出的文件上。
+	outDir := filepath.Join(dir, "out")
+	if err := UnzipWithPassword(zipPath, outDir, "pw"); err != nil {
+		t.Fatalf("UnzipWithPassword() error = %v", err)
+	}
+	info, err := os.Stat(filepath.Join(outDir, "a.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ModTime().UnixMilli() != mtime.UnixMilli() {
+		t.Errorf("extracted mtime = %d, want %d", info.ModTime().UnixMilli(), mtime.UnixMilli())
+	}
+
+	// Unknown extra ids are skipped by standard readers, so the archive must stay
+	// readable by the standard library.
+	// 标准读取器会跳过未知 extra id，因此归档必须仍能被标准库读取。
+	std, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatalf("standard archive/zip cannot open the archive: %v", err)
+	}
+	defer std.Close()
+	seen := make(map[string]bool)
+	for _, f := range std.File {
+		seen[f.Name] = true
+	}
+	for _, name := range names {
+		if !seen[name] {
+			t.Errorf("standard reader does not see entry %q", name)
+		}
+	}
+}
+
+// Archives written without WithEntryTimes must simply yield no timestamps rather
+// than failing.
+// 未使用 WithEntryTimes 写入的归档应只返回空结果，而不是报错。
+func TestReadEntryTimes_EmptyWithoutOption(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "a.md"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	zipPath := filepath.Join(dir, "backup.zip")
+	if err := ZipWithPassword(srcDir, zipPath, ""); err != nil {
+		t.Fatalf("ZipWithPassword() error = %v", err)
+	}
+
+	got, err := ReadEntryTimes(zipPath)
+	if err != nil {
+		t.Fatalf("ReadEntryTimes() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ReadEntryTimes() = %v, want empty", got)
+	}
+}
+
+// A third-party extra field that reuses our id with a different payload — or a
+// truncated copy of ours — must be ignored, never misread as timestamps.
+// 第三方字段若复用了我们的 id 但载荷不同，或我们的块被截断，都必须被忽略，
+// 绝不能误读成时间戳。
+func TestDecodeEntryTimes_RejectsForeignAndTruncated(t *testing.T) {
+	// Same id, 8-byte payload instead of the expected 17.
+	// id 相同，但载荷是 8 字节而非预期的 17 字节。
+	foreign := []byte{0x4E, 0x46, 0x08, 0x00, 1, 2, 3, 4, 5, 6, 7, 8}
+	if _, ok := decodeEntryTimes(foreign); ok {
+		t.Error("decodeEntryTimes() accepted a foreign payload")
+	}
+
+	block := encodeEntryTimes(EntryTimes{Ctime: 1, Mtime: 2})
+	if _, ok := decodeEntryTimes(block[:len(block)-1]); ok {
+		t.Error("decodeEntryTimes() accepted a truncated block")
+	}
+
+	// An unrelated field followed by ours must still be found.
+	// 无关字段在前、我们的块在后时仍应被找到。
+	combined := append(append([]byte{}, foreign...), block...)
+	got, ok := decodeEntryTimes(combined)
+	if !ok {
+		t.Fatal("decodeEntryTimes() did not find the block after a foreign one")
+	}
+	if got.Ctime != 1 || got.Mtime != 2 {
+		t.Errorf("decodeEntryTimes() = %+v, want {Ctime:1 Mtime:2}", got)
 	}
 }
