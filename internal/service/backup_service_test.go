@@ -12,6 +12,7 @@ import (
 	"github.com/haierkeys/fast-note-sync-service/internal/domain"
 	domainmocks "github.com/haierkeys/fast-note-sync-service/internal/domain/mocks"
 	"github.com/haierkeys/fast-note-sync-service/internal/dto"
+	"github.com/haierkeys/fast-note-sync-service/pkg/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"go.uber.org/zap"
@@ -385,5 +386,111 @@ func TestBackupService_ApplySourceMtime_SkipsUnknown(t *testing.T) {
 	}
 	if !after.ModTime().Equal(before.ModTime()) {
 		t.Errorf("mtime changed from %v to %v", before.ModTime(), after.ModTime())
+	}
+}
+
+// msOrZero must map "no timestamp" to 0 so the archive can omit the value rather
+// than recording 1970-01-01.
+// msOrZero 必须把「无时间戳」映射为 0，让归档省略该值，而不是记成 1970-01-01。
+func TestMsOrZero(t *testing.T) {
+	if got := msOrZero(time.Time{}); got != 0 {
+		t.Errorf("msOrZero(zero time) = %d, want 0", got)
+	}
+	if got := msOrZero(time.UnixMilli(0)); got != 0 {
+		t.Errorf("msOrZero(epoch) = %d, want 0", got)
+	}
+	want := time.Date(2023, 4, 5, 6, 7, 8, 0, time.UTC)
+	if got := msOrZero(want); got != want.UnixMilli() {
+		t.Errorf("msOrZero(%v) = %d, want %d", want, got, want.UnixMilli())
+	}
+}
+
+// newEntryTimes must carry both timestamps through, and collapse an unreported
+// time to the zero value that callers use to skip the entry entirely.
+// newEntryTimes 必须原样带出两个时间戳，并把客户端未上报的时间折叠成零值——
+// 调用方据此完全跳过该条目。
+func TestNewEntryTimes(t *testing.T) {
+	ctime := time.Date(2020, 1, 2, 3, 4, 6, 0, time.UTC)
+	mtime := time.Date(2021, 5, 6, 7, 8, 10, 0, time.UTC)
+
+	got := newEntryTimes(ctime, mtime)
+	if got.Ctime != ctime.UnixMilli() || got.Mtime != mtime.UnixMilli() {
+		t.Errorf("newEntryTimes() = %+v, want {Ctime:%d Mtime:%d}",
+			got, ctime.UnixMilli(), mtime.UnixMilli())
+	}
+
+	// A resource the client never reported times for must be omittable.
+	// 客户端从未上报时间的资源必须可以被省略。
+	if zero := newEntryTimes(time.Time{}, time.Time{}); zero != (util.EntryTimes{}) {
+		t.Errorf("newEntryTimes(zero, zero) = %+v, want the zero EntryTimes", zero)
+	}
+}
+
+// An archive the reader cannot open must not abort the import: the caller gets
+// nil and falls back to the ZIP entry timestamps.
+// 读取器打不开的归档不得让导入中断：调用方拿到 nil，回退到 ZIP 条目时间。
+func TestBackupService_ReadArchiveEntryTimes_UnreadableYieldsNil(t *testing.T) {
+	svc := &backupService{logger: zap.NewNop()}
+	dir := t.TempDir()
+
+	notAZip := filepath.Join(dir, "not-a-zip.bin")
+	if err := os.WriteFile(notAZip, []byte("definitely not a zip"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.readArchiveEntryTimes(notAZip); got != nil {
+		t.Errorf("readArchiveEntryTimes() = %v, want nil", got)
+	}
+	if got := svc.readArchiveEntryTimes(filepath.Join(dir, "missing.zip")); got != nil {
+		t.Errorf("readArchiveEntryTimes() on a missing file = %v, want nil", got)
+	}
+}
+
+// Embedded entry times must win over the ZIP-derived mtime because they also
+// supply the ctime a ZIP header cannot hold.
+// 归档内嵌的条目时间必须优先于 ZIP 推导出的 mtime——它还提供了 ZIP 头装不下的 ctime。
+func TestResolveResourceTimes_EntryTimesWin(t *testing.T) {
+	dir := t.TempDir()
+	extracted := filepath.Join(dir, "a.md")
+	if err := os.WriteFile(extracted, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	const fallback = int64(1_700_000_000_000)
+	entryTimes := map[string]util.EntryTimes{
+		"a.md": {Ctime: 1_600_000_000_000, Mtime: 1_600_000_001_000},
+	}
+
+	mtimeMs, ctimeMs := resolveResourceTimes(entryTimes, "a.md", extracted, fallback)
+	if mtimeMs != 1_600_000_001_000 {
+		t.Errorf("mtime = %d, want 1600000001000", mtimeMs)
+	}
+	if ctimeMs != 1_600_000_000_000 {
+		t.Errorf("ctime = %d, want 1600000000000", ctimeMs)
+	}
+}
+
+// Without an embedded entry the mtime still comes from the extracted file (whose
+// ZIP entry timestamp UnzipWithPassword restored) and ctime falls back, since the
+// archive genuinely has no creation time to restore.
+// 没有内嵌条目时，mtime 仍取自解压文件（其 ZIP 条目时间由 UnzipWithPassword 还原），
+// ctime 只能回落——归档里确实没有创建时间可还原。
+func TestResolveResourceTimes_FallsBackWithoutEntryTimes(t *testing.T) {
+	dir := t.TempDir()
+	extracted := filepath.Join(dir, "a.md")
+	if err := os.WriteFile(extracted, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2019, 2, 3, 4, 5, 6, 0, time.UTC)
+	if err := os.Chtimes(extracted, want, want); err != nil {
+		t.Fatal(err)
+	}
+
+	const fallback = int64(1_700_000_000_000)
+	mtimeMs, ctimeMs := resolveResourceTimes(nil, "a.md", extracted, fallback)
+	if mtimeMs != want.UnixMilli() {
+		t.Errorf("mtime = %d, want %d", mtimeMs, want.UnixMilli())
+	}
+	if ctimeMs != fallback {
+		t.Errorf("ctime = %d, want fallback %d", ctimeMs, fallback)
 	}
 }

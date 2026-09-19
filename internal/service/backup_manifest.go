@@ -19,6 +19,12 @@ const (
 	// BackupNoteHistoryFileName 压缩包内笔记历史数据文件路径。
 	BackupNoteHistoryFileName = BackupMetaDirPrefix + "note_history.json"
 
+	// Resource timestamps are NOT a file here: ZIP headers cannot express creation
+	// time and truncate the modification time to 2 seconds, so the exact values
+	// travel in a private per-entry extra field instead (see util.EntryTimes).
+	// 资源时间戳不占用这里的文件：ZIP 头无法表达创建时间、且把修改时间截断到 2 秒，
+	// 因此精确值改由 util.EntryTimes 的私有逐条目 extra 字段携带。
+
 	// VaultConfigDirPrefix marks vault config files inside the archive.
 	// VaultConfigDirPrefix 标识压缩包内的仓库配置文件。
 	VaultConfigDirPrefix = ".obsidian/"
