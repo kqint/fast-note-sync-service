@@ -47,6 +47,14 @@ func (m *MockNoteHistoryRepository) ListByNoteID(ctx context.Context, noteID int
 	return args.Get(0).([]*domain.NoteHistory), args.Get(1).(int64), args.Error(2)
 }
 
+func (m *MockNoteHistoryRepository) ListAllByVault(ctx context.Context, vaultID, uid int64) ([]*domain.NoteHistory, error) {
+	args := m.Called(ctx, vaultID, uid)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*domain.NoteHistory), args.Error(1)
+}
+
 func (m *MockNoteHistoryRepository) GetLatestVersion(ctx context.Context, noteID, uid int64) (int64, error) {
 	args := m.Called(ctx, noteID, uid)
 	return args.Get(0).(int64), args.Error(1)

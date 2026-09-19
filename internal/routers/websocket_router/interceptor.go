@@ -7,6 +7,7 @@ import (
 	pkgapp "github.com/haierkeys/fast-note-sync-service/pkg/app"
 	"github.com/haierkeys/fast-note-sync-service/pkg/code"
 	"github.com/haierkeys/fast-note-sync-service/pkg/json"
+	"github.com/haierkeys/fast-note-sync-service/pkg/syncgate"
 	"github.com/haierkeys/fast-note-sync-service/pkg/util"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -19,6 +20,9 @@ func NewMessageInterceptor(appContainer *app.App) func(*pkgapp.WebsocketClient, 
 	logger := appContainer.Logger()
 	return func(c *pkgapp.WebsocketClient, msg *pkgapp.WebSocketMessage) bool {
 		if !checkAuth(c, msg, logger) {
+			return false
+		}
+		if !checkVaultSyncPaused(c, msg, logger) {
 			return false
 		}
 		if !checkVaultAccess(c, msg, logger) {
@@ -44,6 +48,32 @@ func checkAuth(c *pkgapp.WebsocketClient, msg *pkgapp.WebSocketMessage, logger i
 		return false
 	}
 	return true
+}
+
+// checkVaultSyncPaused 在仓库执行导入等维护操作期间拦截该仓库的所有业务消息。
+// checkVaultSyncPaused rejects all business messages of a vault while a
+// maintenance operation (e.g. backup import) is in progress for it.
+func checkVaultSyncPaused(c *pkgapp.WebsocketClient, msg *pkgapp.WebSocketMessage, logger interface {
+	Warn(string, ...zapcore.Field)
+}) bool {
+	if c.User == nil {
+		return true
+	}
+	var vaultInfo struct {
+		Vault string `json:"vault"`
+	}
+	if err := json.Unmarshal(msg.Data, &vaultInfo); err != nil || vaultInfo.Vault == "" {
+		return true
+	}
+	if !syncgate.IsPaused(c.User.UID, vaultInfo.Vault) {
+		return true
+	}
+	logger.Warn("WS OnMessage Vault Sync Paused",
+		zap.String("Type", msg.Type),
+		zap.String("uid", c.User.ID),
+		zap.String("vault", vaultInfo.Vault))
+	c.ToResponse(code.ErrorVaultSyncPaused.WithDetails("Vault sync is paused during data import: "+vaultInfo.Vault), msg.Type+"Ack")
+	return false
 }
 
 // checkVaultAccess 针对活跃 WebSocket 连接校验笔记库访问权限限制。

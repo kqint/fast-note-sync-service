@@ -92,6 +92,32 @@ func (m *MockBackupRepository) DisableByVaultID(ctx context.Context, vaultID, ui
 	return args.Error(0)
 }
 
+func (m *MockBackupRepository) CreateImportHistory(ctx context.Context, history *domain.BackupImportHistory, uid int64) (*domain.BackupImportHistory, error) {
+	args := m.Called(ctx, history, uid)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*domain.BackupImportHistory), args.Error(1)
+}
+
+func (m *MockBackupRepository) SaveImportHistory(ctx context.Context, history *domain.BackupImportHistory, uid int64) error {
+	args := m.Called(ctx, history, uid)
+	return args.Error(0)
+}
+
+func (m *MockBackupRepository) ListImportHistory(ctx context.Context, uid int64, page, pageSize int) ([]*domain.BackupImportHistory, int64, error) {
+	args := m.Called(ctx, uid, page, pageSize)
+	if args.Get(0) == nil {
+		return nil, args.Get(1).(int64), args.Error(2)
+	}
+	return args.Get(0).([]*domain.BackupImportHistory), args.Get(1).(int64), args.Error(2)
+}
+
+func (m *MockBackupRepository) StopOrphanImportHistories(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
 // Compile-time check: MockBackupRepository must implement domain.BackupRepository.
 // 编译时检查：MockBackupRepository 必须实现 domain.BackupRepository 接口。
 var _ domain.BackupRepository = (*MockBackupRepository)(nil)

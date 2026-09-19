@@ -11,8 +11,8 @@ import (
 
 // AppError unified application error struct
 // AppError 统一应用错误结构体
-// Contains error code, message, details, trace ID and timestamp
-// 包含错误码、消息、详情、追踪ID和时间戳
+// Contains error code, message, details, optional data, trace ID and timestamp
+// 包含错误码、消息、详情、可选数据、追踪ID和时间戳
 type AppError struct {
 	// Code error code
 	// Code 错误码
@@ -23,6 +23,10 @@ type AppError struct {
 	// Details error details (optional)
 	// Details 错误详情（可选）
 	Details []string `json:"details,omitempty"`
+	// Data optional structured payload embedded in the error (e.g. 545 partial
+	// import availability), passthrough of code.Code.WithData
+	// Data 错误内嵌的结构化数据（如 545 部分导入可用性），透传自 code.Code.WithData
+	Data interface{} `json:"data,omitempty"`
 	// TraceID request trace ID
 	// TraceID 请求追踪ID
 	TraceID string `json:"traceId,omitempty"`
@@ -53,6 +57,7 @@ func NewAppError(c *code.Code, cause error) *AppError {
 		Code:      c.Code(),
 		Message:   c.Msg(),
 		Details:   c.Details(),
+		Data:      errorData(c),
 		Cause:     cause,
 		Timestamp: time.Now(),
 	}
@@ -125,6 +130,7 @@ func ErrorResponse(c *gin.Context, err error) {
 			Code:      codeErr.Code(),
 			Message:   codeErr.Msg(),
 			Details:   codeErr.Details(),
+			Data:      errorData(codeErr),
 			TraceID:   traceID,
 			Timestamp: time.Now(),
 		}
@@ -152,11 +158,21 @@ func ErrorResponseWithCode(c *gin.Context, codeErr *code.Code, cause error) {
 		Code:      codeErr.Code(),
 		Message:   codeErr.Msg(),
 		Details:   codeErr.Details(),
+		Data:      errorData(codeErr),
 		TraceID:   traceID,
 		Cause:     cause,
 		Timestamp: time.Now(),
 	}
 	c.JSON(http.StatusOK, response)
+}
+
+// errorData extracts the structured payload from a Code if present.
+// errorData 提取 Code 内嵌的结构化数据（无数据时返回 nil）。
+func errorData(codeErr *code.Code) interface{} {
+	if codeErr == nil || !codeErr.HaveData() {
+		return nil
+	}
+	return codeErr.Data()
 }
 
 // IsAppError checks if error is of type AppError

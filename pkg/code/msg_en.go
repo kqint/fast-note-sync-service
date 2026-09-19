@@ -130,4 +130,15 @@ var en_messages = map[int]string{
 	520: "Cloudflared download failed",
 	521: "Cloudflared binary not found, please download the tunnel program first",
 	530: "Sync conflict detected, a conflict copy has been created",
+
+	// Backup Import
+	540: "Import file is required",
+	541: "Failed to extract backup archive (check the file and password)",
+	542: "Invalid import options: select at least one section, note history also requires notes & attachments",
+	544: "Invalid backup archive (no importable content)",
+	545: "Requested sections are missing in the backup archive, you may import the available sections only",
+	546: "Vault sync is paused during data import, please try again later",
+	547: "Import file is not a valid ZIP archive",
+	548: "Import file exceeds the size limit",
+	549: "Import task not found, already finished, or the operation is not allowed in the current state",
 }

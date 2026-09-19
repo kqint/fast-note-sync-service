@@ -25,6 +25,9 @@ func AutoMigrate(db *gorm.DB, key string) error {
 	case "BackupHistory":
 		return db.AutoMigrate(BackupHistory{})
 
+	case "BackupImportHistory":
+		return db.AutoMigrate(BackupImportHistory{})
+
 	case "File":
 		return db.AutoMigrate(File{})
 

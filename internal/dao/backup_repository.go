@@ -38,12 +38,17 @@ func init() {
 		Name:        "BackupHistory",
 		RepoFactory: factory,
 	})
+	RegisterModel(ModelConfig{
+		Name:        "BackupImportHistory",
+		RepoFactory: factory,
+	})
 }
 
 func (r *backupRepository) backup(uid int64) *query.Query {
 	return r.dao.QueryWithOnceInit(func(g *gorm.DB) {
 		model.AutoMigrate(g, "BackupConfig")
 		model.AutoMigrate(g, "BackupHistory")
+		model.AutoMigrate(g, "BackupImportHistory")
 	}, r.GetKey(uid)+"#backup", r.GetKey(uid))
 }
 
@@ -151,6 +156,73 @@ func (r *backupRepository) historyToModel(d *domain.BackupHistory) *model.Backup
 		CreatedAt: timex.Time(d.CreatedAt),
 		UpdatedAt: timex.Time(d.UpdatedAt),
 	}
+}
+
+func (r *backupRepository) importHistoryToDomain(m *model.BackupImportHistory) *domain.BackupImportHistory {
+	if m == nil {
+		return nil
+	}
+	return &domain.BackupImportHistory{
+		ID:                  m.ID,
+		UID:                 m.UID,
+		TaskID:              m.TaskID,
+		VaultName:           m.VaultName,
+		FileName:            m.FileName,
+		FileSize:            m.FileSize,
+		Status:              int(m.Status),
+		StartTime:           m.StartTime,
+		EndTime:             m.EndTime,
+		DurationMs:          m.DurationMs,
+		IncludeNotes:        m.IncludeNotes == 1,
+		IncludeVaultConfig:  m.IncludeVaultConfig == 1,
+		IncludeNoteHistory:  m.IncludeNoteHistory == 1,
+		AllowPartial:        m.AllowPartial == 1,
+		NotesCount:          m.NotesCount,
+		FilesCount:          m.FilesCount,
+		SettingsCount:       m.SettingsCount,
+		NoteHistoryCount:    m.NoteHistoryCount,
+		SkippedHistoryCount: m.SkippedHistoryCount,
+		Message:             m.Message,
+		CreatedAt:           time.Time(m.CreatedAt),
+		UpdatedAt:           time.Time(m.UpdatedAt),
+	}
+}
+
+func (r *backupRepository) importHistoryToModel(d *domain.BackupImportHistory) *model.BackupImportHistory {
+	if d == nil {
+		return nil
+	}
+	return &model.BackupImportHistory{
+		ID:                  d.ID,
+		UID:                 d.UID,
+		TaskID:              d.TaskID,
+		VaultName:           d.VaultName,
+		FileName:            d.FileName,
+		FileSize:            d.FileSize,
+		Status:              int64(d.Status),
+		StartTime:           d.StartTime,
+		EndTime:             d.EndTime,
+		DurationMs:          d.DurationMs,
+		IncludeNotes:        boolToInt64(d.IncludeNotes),
+		IncludeVaultConfig:  boolToInt64(d.IncludeVaultConfig),
+		IncludeNoteHistory:  boolToInt64(d.IncludeNoteHistory),
+		AllowPartial:        boolToInt64(d.AllowPartial),
+		NotesCount:          d.NotesCount,
+		FilesCount:          d.FilesCount,
+		SettingsCount:       d.SettingsCount,
+		NoteHistoryCount:    d.NoteHistoryCount,
+		SkippedHistoryCount: d.SkippedHistoryCount,
+		Message:             d.Message,
+		CreatedAt:           timex.Time(d.CreatedAt),
+		UpdatedAt:           timex.Time(d.UpdatedAt),
+	}
+}
+
+func boolToInt64(v bool) int64 {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 func (r *backupRepository) GetByID(ctx context.Context, id, uid int64) (*domain.BackupConfig, error) {
@@ -324,6 +396,92 @@ func (r *backupRepository) DisableByVaultID(ctx context.Context, vaultID, uid in
 		_, err := q.WithContext(ctx).Where(q.VaultID.Eq(vaultID), q.UID.Eq(uid)).UpdateSimple(q.IsEnabled.Value(0))
 		return err
 	})
+}
+
+// CreateImportHistory 落库一条 running 状态的导入历史（提交即写入）
+func (r *backupRepository) CreateImportHistory(ctx context.Context, history *domain.BackupImportHistory, uid int64) (*domain.BackupImportHistory, error) {
+	var result *domain.BackupImportHistory
+	err := r.dao.ExecuteWrite(ctx, uid, r, func(db *gorm.DB) error {
+		q := r.backup(uid).BackupImportHistory
+		m := r.importHistoryToModel(history)
+		m.UID = uid
+		now := timex.Now()
+		m.CreatedAt = now
+		m.UpdatedAt = now
+		if err := q.WithContext(ctx).Create(m); err != nil {
+			return err
+		}
+		result = r.importHistoryToDomain(m)
+		return nil
+	})
+	return result, err
+}
+
+// SaveImportHistory 回填导入历史的终态与统计（按 ID 全量覆盖）
+func (r *backupRepository) SaveImportHistory(ctx context.Context, history *domain.BackupImportHistory, uid int64) error {
+	if history == nil || history.ID <= 0 {
+		return nil
+	}
+	return r.dao.ExecuteWrite(ctx, uid, r, func(db *gorm.DB) error {
+		q := r.backup(uid).BackupImportHistory
+		m := r.importHistoryToModel(history)
+		m.UID = uid
+		m.UpdatedAt = timex.Now()
+		if m.CreatedAt.IsZero() {
+			// Preserve the original creation time when the caller didn't carry it
+			// 调用方未携带创建时间时保留库中的原值
+			if old, err := q.WithContext(ctx).Where(q.ID.Eq(history.ID), q.UID.Eq(uid)).First(); err == nil {
+				m.CreatedAt = old.CreatedAt
+			}
+		}
+		return q.WithContext(ctx).Save(m)
+	})
+}
+
+// ListImportHistory 分页查询导入历史，按 ID 倒序（最新在前）
+func (r *backupRepository) ListImportHistory(ctx context.Context, uid int64, page, pageSize int) ([]*domain.BackupImportHistory, int64, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 10
+	}
+	q := r.backup(uid).BackupImportHistory
+	offset := (page - 1) * pageSize
+	modelList, count, err := q.WithContext(ctx).Where(q.UID.Eq(uid)).Order(q.ID.Desc()).FindByPage(offset, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var list []*domain.BackupImportHistory
+	for _, m := range modelList {
+		list = append(list, r.importHistoryToDomain(m))
+	}
+	return list, count, nil
+}
+
+// StopOrphanImportHistories 服务启动时把残留的 running 记录收尾为 stopped。
+// 重启后内存中的任务已不存在，这些记录不可能再被更新，只能在此统一兜底。
+func (r *backupRepository) StopOrphanImportHistories(ctx context.Context) error {
+	uids, err := r.dao.GetAllUserUIDs()
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	for _, uid := range uids {
+		if err := r.dao.ExecuteWrite(ctx, uid, r, func(db *gorm.DB) error {
+			q := r.backup(uid).BackupImportHistory
+			_, err := q.WithContext(ctx).Where(q.Status.Eq(domain.BackupImportStatusRunning)).UpdateSimple(
+				q.Status.Value(domain.BackupImportStatusStopped),
+				q.Message.Value("Import interrupted by service restart"),
+				q.EndTime.Value(now),
+			)
+			return err
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Ensure backupRepository implements domain.BackupRepository interface

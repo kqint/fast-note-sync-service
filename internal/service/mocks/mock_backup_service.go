@@ -64,6 +64,38 @@ func (m *MockBackupService) NotifyUpdated(uid int64) {
 	m.Called(uid)
 }
 
+func (m *MockBackupService) SubmitImportBackup(ctx context.Context, uid int64, req *dto.BackupImportRequest, zipPath string) (*dto.BackupImportTaskDTO, error) {
+	args := m.Called(ctx, uid, req, zipPath)
+	if v := args.Get(0); v != nil {
+		return v.(*dto.BackupImportTaskDTO), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
+func (m *MockBackupService) GetImportTaskStatus(ctx context.Context, uid int64, taskID string) (*dto.BackupImportTaskStatusDTO, error) {
+	args := m.Called(ctx, uid, taskID)
+	if v := args.Get(0); v != nil {
+		return v.(*dto.BackupImportTaskStatusDTO), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
+func (m *MockBackupService) ConfirmImportTask(ctx context.Context, uid int64, taskID string, allowPartial bool) (*dto.BackupImportTaskStatusDTO, error) {
+	args := m.Called(ctx, uid, taskID, allowPartial)
+	if v := args.Get(0); v != nil {
+		return v.(*dto.BackupImportTaskStatusDTO), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
+func (m *MockBackupService) ListImportHistory(ctx context.Context, uid int64, pager *app.Pager) ([]*dto.BackupImportHistoryDTO, int64, error) {
+	args := m.Called(ctx, uid, pager)
+	if v := args.Get(0); v != nil {
+		return v.([]*dto.BackupImportHistoryDTO), args.Get(1).(int64), args.Error(2)
+	}
+	return nil, args.Get(1).(int64), args.Error(2)
+}
+
 func (m *MockBackupService) Shutdown(ctx context.Context) error {
 	args := m.Called(ctx)
 	return args.Error(0)

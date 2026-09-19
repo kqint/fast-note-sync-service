@@ -246,6 +246,33 @@ func (r *noteHistoryRepository) ListByNoteID(ctx context.Context, noteID int64, 
 	return results, count, nil
 }
 
+// ListAllByVault retrieves all history records of a vault (with content and patch hydrated)
+// ListAllByVault 获取仓库下的所有历史记录（内容与补丁已填充）
+func (r *noteHistoryRepository) ListAllByVault(ctx context.Context, vaultID, uid int64) ([]*domain.NoteHistory, error) {
+	u := r.noteHistory(uid).NoteHistory
+	modelList, err := u.WithContext(ctx).Where(u.VaultID.Eq(vaultID)).Order(u.Version.Desc()).Find()
+	if err != nil {
+		return nil, err
+	}
+
+	var results []*domain.NoteHistory
+	for _, m := range modelList {
+		h, err := r.toDomain(m, uid)
+		if err != nil {
+			// Skip records whose sidecar files are missing instead of failing the whole export
+			// 跳过 sidecar 文件缺失的记录，避免影响整体导出
+			r.dao.Logger().Warn("skip history record with missing content files",
+				zap.Int64(logger.FieldUID, uid),
+				zap.Int64("historyId", m.ID),
+				zap.Error(err),
+			)
+			continue
+		}
+		results = append(results, h)
+	}
+	return results, nil
+}
+
 // GetLatestVersion retrieves the latest version number of the note
 // GetLatestVersion 获取笔记的最新版本号
 func (r *noteHistoryRepository) GetLatestVersion(ctx context.Context, noteID, uid int64) (int64, error) {

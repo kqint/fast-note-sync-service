@@ -203,6 +203,11 @@ func registerAPIRoutes(r *gin.Engine, appContainer *app.App, wss *pkgapp.Websock
 				webguiGroup.GET("/admin/gc", adminControlHandler.GC)
 				webguiGroup.GET("/admin/cloudflared_tunnel_download", adminControlHandler.CloudflaredTunnelDownload)
 
+				// Server config file backup/import (raw config.yaml)
+				// 服务端配置文件备份/导入 (原始 config.yaml)
+				webguiGroup.GET("/admin/config/export", adminControlHandler.ExportConfigFile)
+				webguiGroup.POST("/admin/config/import", adminControlHandler.ImportConfigFile)
+
 				// Admin user managment
 				webguiGroup.GET("/admin/users/list", adminControlHandler.GetUsers)
 				webguiGroup.POST("/admin/users/create", adminControlHandler.CreateUser)
@@ -223,6 +228,10 @@ func registerAPIRoutes(r *gin.Engine, appContainer *app.App, wss *pkgapp.Websock
 				webguiGroup.DELETE("/backup/config", backupHandler.DeleteConfig)
 				webguiGroup.GET("/backup/historys", backupHandler.ListHistory)
 				webguiGroup.POST("/backup/execute", backupHandler.Execute)
+				webguiGroup.POST("/backup/import", backupHandler.Import)
+				webguiGroup.GET("/backup/import/status", backupHandler.ImportStatus)
+				webguiGroup.POST("/backup/import/confirm", backupHandler.ImportConfirm)
+				webguiGroup.GET("/backup/import/historys", backupHandler.ListImportHistory)
 
 				// Git sync routes
 				// Git 同步接口

@@ -2,6 +2,9 @@ package api_router
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"os"
 
 	"github.com/gin-gonic/gin"
 	"github.com/haierkeys/fast-note-sync-service/internal/app"
@@ -10,6 +13,7 @@ import (
 	pkgapp "github.com/haierkeys/fast-note-sync-service/pkg/app"
 	"github.com/haierkeys/fast-note-sync-service/pkg/code"
 	apperrors "github.com/haierkeys/fast-note-sync-service/pkg/errors"
+	"github.com/haierkeys/fast-note-sync-service/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -205,6 +209,230 @@ func (h *BackupHandler) Execute(c *gin.Context) {
 	}
 
 	response.ToResponse(code.Success.WithDetails("Backup task completed, check history for details"))
+}
+
+// Import validates the upload quickly and submits an asynchronous backup import task
+// @Summary Submit a backup import task
+// @Description Quick-checks the upload (size limit, ZIP magic), then runs the import in the background. Poll GET /api/backup/import/status with the returned taskId
+// @Tags Backup
+// @Security UserAuthToken
+// @Accept multipart/form-data
+// @Produce json
+// @Param file formData file true "Backup archive (.zip)"
+// @Param vault formData string true "Target vault name"
+// @Param password formData string false "Archive password"
+// @Param includeNotes formData boolean false "Import notes & attachments"
+// @Param includeVaultConfig formData boolean false "Import vault config (.obsidian)"
+// @Param includeNoteHistory formData boolean false "Import note history (requires includeNotes)"
+// @Success 200 {object} pkgapp.Res{data=dto.BackupImportTaskDTO} "Success"
+// @Failure 400 {object} pkgapp.Res "Invalid Params"
+// @Failure 401 {object} pkgapp.Res "Token Required"
+// @Failure 500 {object} pkgapp.Res "Internal Server Error"
+// @Router /api/backup/import [post]
+func (h *BackupHandler) Import(c *gin.Context) {
+	response := pkgapp.NewResponse(c)
+
+	uid := pkgapp.GetUID(c)
+	if uid == 0 {
+		response.ToResponse(code.ErrorNotUserAuthToken)
+		return
+	}
+
+	params := &dto.BackupImportRequest{
+		Vault:              c.PostForm("vault"),
+		Password:           c.PostForm("password"),
+		IncludeNotes:       c.PostForm("includeNotes") == "true",
+		IncludeVaultConfig: c.PostForm("includeVaultConfig") == "true",
+		IncludeNoteHistory: c.PostForm("includeNoteHistory") == "true",
+		AllowPartial:       c.PostForm("allowPartial") == "true",
+	}
+	if params.Vault == "" {
+		response.ToResponse(code.ErrorBackupVaultRequired)
+		return
+	}
+
+	fileHeader, err := c.FormFile("file")
+	if err != nil {
+		response.ToResponse(code.ErrorBackupImportFileEmpty.WithDetails(err.Error()))
+		return
+	}
+
+	// Keep the original upload name for the import history record. It is not read
+	// from the form (form:"-") to avoid trusting a client-supplied value.
+	// 保留上传时的原始文件名用于导入历史。不从表单读取（form:"-"），避免信任客户端传入值。
+	params.FileName = fileHeader.Filename
+
+	// Size limit checks, layer 1 & 2: reject before streaming the whole body.
+	// 大小限制·第 1、2 层：在流式转储前即拒绝。
+	limitEnabled, limitBytes := h.App.Config().GetBackupImportSizeLimit()
+	if limitEnabled {
+		if c.Request.ContentLength > limitBytes+1<<20 {
+			response.ToResponse(code.ErrorBackupImportFileTooLarge.
+				WithDetails(fmt.Sprintf("content-length %d exceeds limit %d", c.Request.ContentLength, limitBytes)))
+			return
+		}
+		if fileHeader.Size > limitBytes {
+			response.ToResponse(code.ErrorBackupImportFileTooLarge.
+				WithDetails(fmt.Sprintf("%d exceeds limit %d", fileHeader.Size, limitBytes)))
+			return
+		}
+	}
+
+	// Stage the upload outside the service so the request stream is fully
+	// consumed here; the task takes ownership of the temp file afterwards.
+	// 先在处理层暂存上传文件以完整消费请求流；随后由导入任务接管该临时文件。
+	tmpFile, err := os.CreateTemp("", "fns-backup-import-*.zip")
+	if err != nil {
+		response.ToResponse(code.ErrorServerInternal.WithDetails(err.Error()))
+		return
+	}
+	tmpPath := tmpFile.Name()
+
+	if err := func() error {
+		defer tmpFile.Close()
+		src, err := fileHeader.Open()
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		_, err = io.Copy(tmpFile, src)
+		return err
+	}(); err != nil {
+		os.Remove(tmpPath)
+		h.logError(c.Request.Context(), "BackupHandler.Import.SaveUpload", err)
+		response.ToResponse(code.ErrorServerInternal.WithDetails(err.Error()))
+		return
+	}
+
+	// ZIP magic check: reject non-ZIP uploads (e.g. renamed executables) early.
+	// ZIP 魔数校验：提前拦截非 ZIP 上传（如改名的可执行文件）。
+	if !util.IsZipFile(tmpPath) {
+		os.Remove(tmpPath)
+		response.ToResponse(code.ErrorBackupImportNotZip)
+		return
+	}
+
+	task, err := h.App.BackupService.SubmitImportBackup(c.Request.Context(), uid, params, tmpPath)
+	if err != nil {
+		h.logError(c.Request.Context(), "BackupHandler.Import", err)
+		apperrors.ErrorResponse(c, err)
+		return
+	}
+
+	response.ToResponse(code.SuccessCreate.WithData(task))
+}
+
+// ImportStatus returns the snapshot of an async backup import task
+// @Summary Get backup import task status
+// @Description Poll the background import task by id; phases: validating | await_partial | importing | success | failed | cancelled
+// @Tags Backup
+// @Security UserAuthToken
+// @Produce json
+// @Param taskId query string true "Task ID"
+// @Success 200 {object} pkgapp.Res{data=dto.BackupImportTaskStatusDTO} "Success"
+// @Failure 400 {object} pkgapp.Res "Invalid Params"
+// @Failure 401 {object} pkgapp.Res "Token Required"
+// @Failure 500 {object} pkgapp.Res "Internal Server Error"
+// @Router /api/backup/import/status [get]
+func (h *BackupHandler) ImportStatus(c *gin.Context) {
+	response := pkgapp.NewResponse(c)
+
+	uid := pkgapp.GetUID(c)
+	if uid == 0 {
+		response.ToResponse(code.ErrorNotUserAuthToken)
+		return
+	}
+
+	params := &dto.BackupImportTaskQuery{}
+	if valid, errs := pkgapp.BindAndValid(c, params); !valid {
+		response.ToResponse(code.ErrorInvalidParams.WithDetails(errs.ErrorsToString()).WithData(errs.MapsToString()))
+		return
+	}
+
+	status, err := h.App.BackupService.GetImportTaskStatus(c.Request.Context(), uid, params.TaskID)
+	if err != nil {
+		h.logError(c.Request.Context(), "BackupHandler.ImportStatus", err)
+		apperrors.ErrorResponse(c, err)
+		return
+	}
+
+	response.ToResponse(code.Success.WithData(status))
+}
+
+// ImportConfirm confirms or cancels an await_partial backup import task
+// @Summary Confirm backup import task
+// @Description For tasks in await_partial: allowPartial=true imports the available sections only; false cancels the task
+// @Tags Backup
+// @Security UserAuthToken
+// @Accept json
+// @Produce json
+// @Param params body dto.BackupImportConfirmRequest true "Confirm Parameters"
+// @Success 200 {object} pkgapp.Res{data=dto.BackupImportTaskStatusDTO} "Success"
+// @Failure 400 {object} pkgapp.Res "Invalid Params"
+// @Failure 401 {object} pkgapp.Res "Token Required"
+// @Failure 500 {object} pkgapp.Res "Internal Server Error"
+// @Router /api/backup/import/confirm [post]
+func (h *BackupHandler) ImportConfirm(c *gin.Context) {
+	response := pkgapp.NewResponse(c)
+
+	uid := pkgapp.GetUID(c)
+	if uid == 0 {
+		response.ToResponse(code.ErrorNotUserAuthToken)
+		return
+	}
+
+	params := &dto.BackupImportConfirmRequest{}
+	if valid, errs := pkgapp.BindAndValid(c, params); !valid {
+		response.ToResponse(code.ErrorInvalidParams.WithDetails(errs.ErrorsToString()).WithData(errs.MapsToString()))
+		return
+	}
+
+	status, err := h.App.BackupService.ConfirmImportTask(c.Request.Context(), uid, params.TaskID, params.AllowPartial)
+	if err != nil {
+		h.logError(c.Request.Context(), "BackupHandler.ImportConfirm", err)
+		apperrors.ErrorResponse(c, err)
+		return
+	}
+
+	response.ToResponse(code.Success.WithData(status))
+}
+
+// ListImportHistory gets backup import history list
+// @Summary Get backup import history list
+// @Description Paginated import history for the current user, newest first. Records are created when an import is submitted and finalized once the task reaches a terminal state
+// @Tags Backup
+// @Security UserAuthToken
+// @Produce json
+// @Param params query dto.BackupImportHistoryListRequest true "Backup Import History List Parameters"
+// @Success 200 {object} pkgapp.Res{data=pkgapp.ListRes{list=[]dto.BackupImportHistoryDTO}} "Success"
+// @Failure 400 {object} pkgapp.Res "Invalid Params"
+// @Failure 401 {object} pkgapp.Res "Token Required"
+// @Failure 500 {object} pkgapp.Res "Internal Server Error"
+// @Router /api/backup/import/historys [get]
+func (h *BackupHandler) ListImportHistory(c *gin.Context) {
+	response := pkgapp.NewResponse(c)
+	params := &dto.BackupImportHistoryListRequest{}
+	pager := pkgapp.NewPager(c)
+
+	if valid, errs := pkgapp.BindAndValid(c, params); !valid {
+		response.ToResponse(code.ErrorInvalidParams.WithDetails(errs.ErrorsToString()).WithData(errs.MapsToString()))
+		return
+	}
+
+	uid := pkgapp.GetUID(c)
+	if uid == 0 {
+		response.ToResponse(code.ErrorNotUserAuthToken)
+		return
+	}
+
+	list, total, err := h.App.BackupService.ListImportHistory(c.Request.Context(), uid, pager)
+	if err != nil {
+		h.logError(c.Request.Context(), "BackupHandler.ListImportHistory", err)
+		apperrors.ErrorResponse(c, err)
+		return
+	}
+
+	response.ToResponseList(code.Success, list, int(total))
 }
 
 func (h *BackupHandler) logError(ctx context.Context, method string, err error) {

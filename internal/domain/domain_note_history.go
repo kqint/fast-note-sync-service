@@ -37,6 +37,9 @@ type NoteHistoryRepository interface {
 	// ListByNoteID 根据笔记ID获取历史记录列表
 	ListByNoteID(ctx context.Context, noteID int64, page, pageSize int, uid int64) ([]*NoteHistory, int64, error)
 
+	// ListAllByVault 获取仓库下的所有历史记录（含内容与补丁）
+	ListAllByVault(ctx context.Context, vaultID, uid int64) ([]*NoteHistory, error)
+
 	// GetLatestVersion 获取笔记的最新版本号
 	GetLatestVersion(ctx context.Context, noteID, uid int64) (int64, error)
 

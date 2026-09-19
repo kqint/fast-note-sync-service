@@ -106,6 +106,15 @@ func (c *AppConfig) Save() error {
 	return nil
 }
 
+// GetBackupImportSizeLimit resolves the backup import size limit live from the
+// app settings. Returns (enabled, limitBytes); disabled by default, and when
+// enabled a missing/invalid size falls back to config.DefaultBackupImportSizeLimitBytes.
+// GetBackupImportSizeLimit 从应用设置实时解析备份导入大小限制，返回 (是否启用, 上限字节数)。
+// 默认关闭；启用时缺失/非法配置回退 config.DefaultBackupImportSizeLimitBytes (2GB)。
+func (c *AppConfig) GetBackupImportSizeLimit() (bool, int64) {
+	return c.App.BackupImportSizeLimitResolved()
+}
+
 // GetWorkerPoolConfig gets Worker Pool configuration
 // GetWorkerPoolConfig 获取 Worker Pool 配置
 func (c *AppConfig) GetWorkerPoolConfig() workerpool.Config {

@@ -89,6 +89,14 @@ app:
   # 历史记录保存延迟。支持格式: 10s, 1m。
   # delay for saving history records. Supports: 10s, 1m.
   history-save-delay: "10s"
+  # 备份导入文件大小限制开关（默认关闭 = 不限制；如需要限制，改为 true 开启）
+  # 仅作用于笔记备份包（ZIP）导入，不影响「设置导入」；设置导入固定为 2MB 上限且不可配置
+  # Whether to enforce the backup import size limit (default false = unlimited; set to true to enable)
+  # Applies only to note backup archive (ZIP) imports, not to config imports; config imports have a fixed, non-configurable 2MB cap
+  backup-import-size-limit-enabled: false
+  # 备份导入压缩包大小上限（仅开关开启时生效）。例如: 512KB, 1MB, 2GB
+  # Max backup import archive size (only enforced when the switch is on). e.g., 512KB, 1MB, 2GB
+  backup-import-size-limit: "2GB"
   # 文件上传会话超时时长
   # Timeout duration for file upload sessions
   upload-session-timeout: "1d"

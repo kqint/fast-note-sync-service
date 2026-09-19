@@ -17,71 +17,74 @@ import (
 
 func Use(db *gorm.DB, opts ...gen.DOOption) *Query {
 	return &Query{
-		db:             db,
-		AuthToken:      newAuthToken(db, opts...),
-		AuthTokenLog:   newAuthTokenLog(db, opts...),
-		BackupConfig:   newBackupConfig(db, opts...),
-		BackupHistory:  newBackupHistory(db, opts...),
-		File:           newFile(db, opts...),
-		Folder:         newFolder(db, opts...),
-		GitSyncConfig:  newGitSyncConfig(db, opts...),
-		GitSyncHistory: newGitSyncHistory(db, opts...),
-		Note:           newNote(db, opts...),
-		NoteHistory:    newNoteHistory(db, opts...),
-		NoteLink:       newNoteLink(db, opts...),
-		Setting:        newSetting(db, opts...),
-		Storage:        newStorage(db, opts...),
-		SyncLog:        newSyncLog(db, opts...),
-		User:           newUser(db, opts...),
-		UserShare:      newUserShare(db, opts...),
-		Vault:          newVault(db, opts...),
+		db:                  db,
+		AuthToken:           newAuthToken(db, opts...),
+		AuthTokenLog:        newAuthTokenLog(db, opts...),
+		BackupConfig:        newBackupConfig(db, opts...),
+		BackupHistory:       newBackupHistory(db, opts...),
+		BackupImportHistory: newBackupImportHistory(db, opts...),
+		File:                newFile(db, opts...),
+		Folder:              newFolder(db, opts...),
+		GitSyncConfig:       newGitSyncConfig(db, opts...),
+		GitSyncHistory:      newGitSyncHistory(db, opts...),
+		Note:                newNote(db, opts...),
+		NoteHistory:         newNoteHistory(db, opts...),
+		NoteLink:            newNoteLink(db, opts...),
+		Setting:             newSetting(db, opts...),
+		Storage:             newStorage(db, opts...),
+		SyncLog:             newSyncLog(db, opts...),
+		User:                newUser(db, opts...),
+		UserShare:           newUserShare(db, opts...),
+		Vault:               newVault(db, opts...),
 	}
 }
 
 type Query struct {
 	db *gorm.DB
 
-	AuthToken      authToken
-	AuthTokenLog   authTokenLog
-	BackupConfig   backupConfig
-	BackupHistory  backupHistory
-	File           file
-	Folder         folder
-	GitSyncConfig  gitSyncConfig
-	GitSyncHistory gitSyncHistory
-	Note           note
-	NoteHistory    noteHistory
-	NoteLink       noteLink
-	Setting        setting
-	Storage        storage
-	SyncLog        syncLog
-	User           user
-	UserShare      userShare
-	Vault          vault
+	AuthToken           authToken
+	AuthTokenLog        authTokenLog
+	BackupConfig        backupConfig
+	BackupHistory       backupHistory
+	BackupImportHistory backupImportHistory
+	File                file
+	Folder              folder
+	GitSyncConfig       gitSyncConfig
+	GitSyncHistory      gitSyncHistory
+	Note                note
+	NoteHistory         noteHistory
+	NoteLink            noteLink
+	Setting             setting
+	Storage             storage
+	SyncLog             syncLog
+	User                user
+	UserShare           userShare
+	Vault               vault
 }
 
 func (q *Query) Available() bool { return q.db != nil }
 
 func (q *Query) clone(db *gorm.DB) *Query {
 	return &Query{
-		db:             db,
-		AuthToken:      q.AuthToken.clone(db),
-		AuthTokenLog:   q.AuthTokenLog.clone(db),
-		BackupConfig:   q.BackupConfig.clone(db),
-		BackupHistory:  q.BackupHistory.clone(db),
-		File:           q.File.clone(db),
-		Folder:         q.Folder.clone(db),
-		GitSyncConfig:  q.GitSyncConfig.clone(db),
-		GitSyncHistory: q.GitSyncHistory.clone(db),
-		Note:           q.Note.clone(db),
-		NoteHistory:    q.NoteHistory.clone(db),
-		NoteLink:       q.NoteLink.clone(db),
-		Setting:        q.Setting.clone(db),
-		Storage:        q.Storage.clone(db),
-		SyncLog:        q.SyncLog.clone(db),
-		User:           q.User.clone(db),
-		UserShare:      q.UserShare.clone(db),
-		Vault:          q.Vault.clone(db),
+		db:                  db,
+		AuthToken:           q.AuthToken.clone(db),
+		AuthTokenLog:        q.AuthTokenLog.clone(db),
+		BackupConfig:        q.BackupConfig.clone(db),
+		BackupHistory:       q.BackupHistory.clone(db),
+		BackupImportHistory: q.BackupImportHistory.clone(db),
+		File:                q.File.clone(db),
+		Folder:              q.Folder.clone(db),
+		GitSyncConfig:       q.GitSyncConfig.clone(db),
+		GitSyncHistory:      q.GitSyncHistory.clone(db),
+		Note:                q.Note.clone(db),
+		NoteHistory:         q.NoteHistory.clone(db),
+		NoteLink:            q.NoteLink.clone(db),
+		Setting:             q.Setting.clone(db),
+		Storage:             q.Storage.clone(db),
+		SyncLog:             q.SyncLog.clone(db),
+		User:                q.User.clone(db),
+		UserShare:           q.UserShare.clone(db),
+		Vault:               q.Vault.clone(db),
 	}
 }
 
@@ -95,66 +98,69 @@ func (q *Query) WriteDB() *Query {
 
 func (q *Query) ReplaceDB(db *gorm.DB) *Query {
 	return &Query{
-		db:             db,
-		AuthToken:      q.AuthToken.replaceDB(db),
-		AuthTokenLog:   q.AuthTokenLog.replaceDB(db),
-		BackupConfig:   q.BackupConfig.replaceDB(db),
-		BackupHistory:  q.BackupHistory.replaceDB(db),
-		File:           q.File.replaceDB(db),
-		Folder:         q.Folder.replaceDB(db),
-		GitSyncConfig:  q.GitSyncConfig.replaceDB(db),
-		GitSyncHistory: q.GitSyncHistory.replaceDB(db),
-		Note:           q.Note.replaceDB(db),
-		NoteHistory:    q.NoteHistory.replaceDB(db),
-		NoteLink:       q.NoteLink.replaceDB(db),
-		Setting:        q.Setting.replaceDB(db),
-		Storage:        q.Storage.replaceDB(db),
-		SyncLog:        q.SyncLog.replaceDB(db),
-		User:           q.User.replaceDB(db),
-		UserShare:      q.UserShare.replaceDB(db),
-		Vault:          q.Vault.replaceDB(db),
+		db:                  db,
+		AuthToken:           q.AuthToken.replaceDB(db),
+		AuthTokenLog:        q.AuthTokenLog.replaceDB(db),
+		BackupConfig:        q.BackupConfig.replaceDB(db),
+		BackupHistory:       q.BackupHistory.replaceDB(db),
+		BackupImportHistory: q.BackupImportHistory.replaceDB(db),
+		File:                q.File.replaceDB(db),
+		Folder:              q.Folder.replaceDB(db),
+		GitSyncConfig:       q.GitSyncConfig.replaceDB(db),
+		GitSyncHistory:      q.GitSyncHistory.replaceDB(db),
+		Note:                q.Note.replaceDB(db),
+		NoteHistory:         q.NoteHistory.replaceDB(db),
+		NoteLink:            q.NoteLink.replaceDB(db),
+		Setting:             q.Setting.replaceDB(db),
+		Storage:             q.Storage.replaceDB(db),
+		SyncLog:             q.SyncLog.replaceDB(db),
+		User:                q.User.replaceDB(db),
+		UserShare:           q.UserShare.replaceDB(db),
+		Vault:               q.Vault.replaceDB(db),
 	}
 }
 
 type queryCtx struct {
-	AuthToken      IAuthTokenDo
-	AuthTokenLog   IAuthTokenLogDo
-	BackupConfig   IBackupConfigDo
-	BackupHistory  IBackupHistoryDo
-	File           IFileDo
-	Folder         IFolderDo
-	GitSyncConfig  IGitSyncConfigDo
-	GitSyncHistory IGitSyncHistoryDo
-	Note           INoteDo
-	NoteHistory    INoteHistoryDo
-	NoteLink       INoteLinkDo
-	Setting        ISettingDo
-	Storage        IStorageDo
-	SyncLog        ISyncLogDo
-	User           IUserDo
-	UserShare      IUserShareDo
-	Vault          IVaultDo
+	AuthToken           IAuthTokenDo
+	AuthTokenLog        IAuthTokenLogDo
+	BackupConfig        IBackupConfigDo
+	BackupHistory       IBackupHistoryDo
+	BackupImportHistory IBackupImportHistoryDo
+	File                IFileDo
+	Folder              IFolderDo
+	GitSyncConfig       IGitSyncConfigDo
+	GitSyncHistory      IGitSyncHistoryDo
+	Note                INoteDo
+	NoteHistory         INoteHistoryDo
+	NoteLink            INoteLinkDo
+	Setting             ISettingDo
+	Storage             IStorageDo
+	SyncLog             ISyncLogDo
+	User                IUserDo
+	UserShare           IUserShareDo
+	Vault               IVaultDo
 }
 
 func (q *Query) WithContext(ctx context.Context) *queryCtx {
 	return &queryCtx{
-		AuthToken:      q.AuthToken.WithContext(ctx),
-		AuthTokenLog:   q.AuthTokenLog.WithContext(ctx),
-		BackupConfig:   q.BackupConfig.WithContext(ctx),
-		BackupHistory:  q.BackupHistory.WithContext(ctx),
-		File:           q.File.WithContext(ctx),
-		Folder:         q.Folder.WithContext(ctx),
-		GitSyncConfig:  q.GitSyncConfig.WithContext(ctx),
-		GitSyncHistory: q.GitSyncHistory.WithContext(ctx),
-		Note:           q.Note.WithContext(ctx),
-		NoteHistory:    q.NoteHistory.WithContext(ctx),
-		NoteLink:       q.NoteLink.WithContext(ctx),
-		Setting:        q.Setting.WithContext(ctx),
-		Storage:        q.Storage.WithContext(ctx),
-		SyncLog:        q.SyncLog.WithContext(ctx),
-		User:           q.User.WithContext(ctx),
-		UserShare:      q.UserShare.WithContext(ctx),
-		Vault:          q.Vault.WithContext(ctx),
+		AuthToken:           q.AuthToken.WithContext(ctx),
+		AuthTokenLog:        q.AuthTokenLog.WithContext(ctx),
+		BackupConfig:        q.BackupConfig.WithContext(ctx),
+		BackupHistory:       q.BackupHistory.WithContext(ctx),
+		BackupImportHistory: q.BackupImportHistory.WithContext(ctx),
+		File:                q.File.WithContext(ctx),
+		Folder:              q.Folder.WithContext(ctx),
+		GitSyncConfig:       q.GitSyncConfig.WithContext(ctx),
+		GitSyncHistory:      q.GitSyncHistory.WithContext(ctx),
+		Note:                q.Note.WithContext(ctx),
+		NoteHistory:         q.NoteHistory.WithContext(ctx),
+		NoteLink:            q.NoteLink.WithContext(ctx),
+		Setting:             q.Setting.WithContext(ctx),
+		Storage:             q.Storage.WithContext(ctx),
+		SyncLog:             q.SyncLog.WithContext(ctx),
+		User:                q.User.WithContext(ctx),
+		UserShare:           q.UserShare.WithContext(ctx),
+		Vault:               q.Vault.WithContext(ctx),
 	}
 }
 

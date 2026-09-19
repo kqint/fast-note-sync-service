@@ -206,3 +206,73 @@ func TestAdminControlHandler_UpdateConfig_InvalidExpiry(t *testing.T) {
 	assertResponseCode(t, w, code.ErrorInvalidParams.Code())
 	assert.Contains(t, w.Body.String(), "webguiLoginTokenExpiry format invalid")
 }
+
+func TestAdminControlHandler_GetConfig_BackupImportSizeLimit(t *testing.T) {
+	handler, testApp, _ := newTestAdminHandler()
+	cfg := testApp.Config()
+	enable := true
+	cfg.App.BackupImportSizeLimitEnabled = &enable
+	cfg.App.BackupImportSizeLimit = "4GB"
+
+	c, w := newAdminTestContext("GET", "/api/admin/config", "", 1)
+	handler.GetConfig(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assertResponseCode(t, w, code.Success.Code())
+
+	var resp struct {
+		Data dto.AdminConfig `json:"data"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.NotNil(t, resp.Data.BackupImportSizeLimitEnabled)
+	assert.True(t, *resp.Data.BackupImportSizeLimitEnabled)
+	assert.Equal(t, "4GB", *resp.Data.BackupImportSizeLimit)
+}
+
+func TestAdminControlHandler_UpdateConfig_InvalidSizeLimitFormat(t *testing.T) {
+	handler, _, _ := newTestAdminHandler()
+
+	reqBody := `{"backupImportSizeLimit":"abc"}`
+	c, w := newAdminTestContext("POST", "/api/admin/config", reqBody, 1)
+
+	handler.UpdateConfig(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assertResponseCode(t, w, code.ErrorInvalidParams.Code())
+	assert.Contains(t, w.Body.String(), "backupImportSizeLimit format invalid")
+}
+
+func TestAdminControlHandler_UpdateConfig_SizeLimitTooSmall(t *testing.T) {
+	handler, _, _ := newTestAdminHandler()
+
+	reqBody := `{"backupImportSizeLimit":"10B"}`
+	c, w := newAdminTestContext("POST", "/api/admin/config", reqBody, 1)
+
+	handler.UpdateConfig(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assertResponseCode(t, w, code.ErrorInvalidParams.Code())
+	assert.Contains(t, w.Body.String(), "backupImportSizeLimit must be at least 1MB")
+}
+
+func TestAdminControlHandler_UpdateConfig_ValidSizeLimit(t *testing.T) {
+	handler, testApp, _ := newTestAdminHandler()
+	cfg := testApp.Config()
+
+	// Create mock config file for Save() to succeed
+	tempFile, err := os.CreateTemp("", "config_test_*.yaml")
+	assert.NoError(t, err)
+	defer os.Remove(tempFile.Name())
+	cfg.File = tempFile.Name()
+
+	reqBody := `{"backupImportSizeLimitEnabled":true,"backupImportSizeLimit":"4GB"}`
+	c, w := newAdminTestContext("POST", "/api/admin/config", reqBody, 1)
+
+	handler.UpdateConfig(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assertResponseCode(t, w, code.Success.Code())
+	assert.NotNil(t, cfg.App.BackupImportSizeLimitEnabled)
+	assert.True(t, *cfg.App.BackupImportSizeLimitEnabled)
+	assert.Equal(t, "4GB", cfg.App.BackupImportSizeLimit)
+}

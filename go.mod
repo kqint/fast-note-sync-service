@@ -25,6 +25,7 @@ require (
 	github.com/haierkeys/gormTracing v0.0.0-20250102131738-31ab6d84a1ab
 	github.com/jinzhu/copier v0.4.0
 	github.com/juju/ratelimit v1.0.2
+	github.com/klauspost/compress v1.19.0
 	github.com/leanovate/gopter v0.2.11
 	github.com/lxzan/gws v1.10.0
 	github.com/mark3labs/mcp-go v0.56.0
@@ -146,7 +147,6 @@ require (
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/kevinburke/ssh_config v1.6.0 // indirect
-	github.com/klauspost/compress v1.19.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260627054121-477a66015f15 // indirect
