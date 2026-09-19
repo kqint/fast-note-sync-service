@@ -4,6 +4,8 @@ package service
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -331,4 +333,57 @@ func TestBackupService_DeleteConfig_NotFound(t *testing.T) {
 
 	assert.Error(t, err)
 	backupRepo.AssertExpectations(t)
+}
+
+// Full/incremental backups must record each resource's original modification
+// time. Stamping the staging file is what makes util.ZipWithPassword write that
+// time into the archive instead of the backup run time.
+// 全量/增量备份必须记录资源原始修改时间。给暂存文件打上该时间，util.ZipWithPassword
+// 才会把源时间而非备份执行时间写进归档。
+func TestBackupService_ApplySourceMtime(t *testing.T) {
+	svc := &backupService{logger: zap.NewNop()}
+	dir := t.TempDir()
+
+	want := time.Date(2022, 7, 8, 9, 10, 12, 0, time.UTC)
+	target := filepath.Join(dir, "note.md")
+	if err := os.WriteFile(target, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	svc.applySourceMtime(target, "note.md", want)
+
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := info.ModTime().Sub(want); diff > time.Second || diff < -time.Second {
+		t.Errorf("mtime = %v, want %v (diff %v)", info.ModTime().UTC(), want, diff)
+	}
+}
+
+// A zero or negative mtime means "unknown" and must leave the file untouched
+// rather than stamping it with 1970-01-01.
+// 0 或负数表示时间未知，应保持文件原样，而不是打上 1970-01-01。
+func TestBackupService_ApplySourceMtime_SkipsUnknown(t *testing.T) {
+	svc := &backupService{logger: zap.NewNop()}
+	dir := t.TempDir()
+
+	target := filepath.Join(dir, "note.md")
+	if err := os.WriteFile(target, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc.applySourceMtime(target, "note.md", time.UnixMilli(0))
+
+	after, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Errorf("mtime changed from %v to %v", before.ModTime(), after.ModTime())
+	}
 }

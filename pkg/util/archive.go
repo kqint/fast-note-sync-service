@@ -111,9 +111,12 @@ func ZipWithPassword(source, target, password string) error {
 // optionally decrypting password-protected entries (ZipCrypto and AES).
 // Paths inside the archive are cleaned to prevent Zip Slip attacks.
 // Supported compression methods: Store, Deflate, Bzip2 and Zstandard.
+// Each extracted file inherits the archive entry's modification time so that
+// callers (e.g. backup import) can read back the original mtime.
 // UnzipWithPassword 将 zip 压缩包解压到目标目录，支持加密条目（ZipCrypto 与 AES）。
 // 压缩包内的路径会被清理以防止 Zip Slip 攻击。
 // 支持的压缩算法：Store、Deflate、Bzip2 与 Zstandard。
+// 解压出的文件会继承归档条目的修改时间，便于调用方（如备份导入）读回原始 mtime。
 func UnzipWithPassword(source, targetDir, password string) error {
 	registerArchiveDecompressors()
 
@@ -166,6 +169,20 @@ func UnzipWithPassword(source, targetDir, password string) error {
 		}
 		if closeErr != nil {
 			return closeErr
+		}
+
+		// Carry over the entry's timestamp. ZipWithPassword writes the source
+		// file's mtime into the MS-DOS date/time fields; without this the
+		// extracted file would simply show the extraction time.
+		// Both fields are 0 when the archive carries no timestamp, in which
+		// case there is nothing to restore.
+		//
+		// 沿用条目的时间戳。ZipWithPassword 会把源文件 mtime 写进 MS-DOS 日期/时间
+		// 字段；不还原的话解压出来的文件只会显示解压时刻。
+		// 归档未携带时间戳时这两个字段都是 0，此时无需处理。
+		if f.ModifiedDate != 0 || f.ModifiedTime != 0 {
+			mt := f.FileInfo().ModTime()
+			_ = os.Chtimes(destPath, mt, mt)
 		}
 	}
 	return nil

@@ -997,6 +997,7 @@ func (s *backupService) exportArchiveFiles(ctx context.Context, uid, vaultID int
 				return err
 			}
 		}
+		s.applySourceMtime(destPath, path, mtime)
 		totalCount++
 		totalSize += localSize
 		return nil
@@ -1054,9 +1055,36 @@ func (s *backupService) exportVaultSettings(ctx context.Context, uid int64, vaul
 		if err := os.WriteFile(destPath, []byte(st.Content), 0644); err != nil {
 			return count, err
 		}
+		s.applySourceMtime(destPath, st.Path, time.UnixMilli(st.Mtime))
 		count++
 	}
 	return count, nil
+}
+
+// applySourceMtime stamps a staging file with the resource's original
+// modification time. Without it the staging file carries the backup run time,
+// and util.ZipWithPassword — which derives each entry's timestamp from
+// zip.FileInfoHeader — would record the backup time in the archive instead of
+// the source modification time.
+//
+// mtime comes from the database (millisecond epoch); a non-positive value means
+// "unknown" and is skipped. Failures are logged but not fatal: losing a
+// timestamp must not abort an otherwise valid backup.
+//
+// 用资源原始修改时间标记暂存文件。若不设置，暂存文件带的是备份执行时间，而
+// util.ZipWithPassword 通过 zip.FileInfoHeader 取条目时间，归档里记录的就会是
+// 备份时间而非源文件修改时间。
+//
+// mtime 来自数据库（毫秒时间戳），非正值表示未知、跳过。设置失败只记日志不中断：
+// 时间戳丢失不应让一次本来可用的备份整体失败。
+func (s *backupService) applySourceMtime(destPath, path string, mtime time.Time) {
+	if mtime.UnixMilli() <= 0 {
+		return
+	}
+	if err := os.Chtimes(destPath, mtime, mtime); err != nil {
+		s.logger.Warn("Failed to preserve source mtime in backup staging",
+			zap.String("path", path), zap.Error(err))
+	}
 }
 
 // exportNoteHistory exports all note history records of a vault as a single JSON

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -49,6 +50,56 @@ func TestZipUnzipRoundTripWithPassword(t *testing.T) {
 	}
 	if string(gotCfg) != "{\"a\":1}" {
 		t.Fatalf("config content mismatch: %q", string(gotCfg))
+	}
+}
+
+// An archive must carry the source file's modification time rather than the
+// time it was packed: full/incremental backups are only useful for restore when
+// the original timestamps survive the round trip.
+// 归档必须携带源文件的修改时间而非打包时刻：只有原始时间戳能往返，全量/增量备份
+// 对恢复才有意义。
+func TestZipUnzipRoundTripPreservesModTime(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	if err := os.MkdirAll(filepath.Join(srcDir, "attachments"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fixed instant in the past, truncated to an even second because the ZIP
+	// MS-DOS timestamp format only has 2s resolution.
+	// 一个固定的过去时刻，截断到偶数秒——ZIP 的 MS-DOS 时间格式只有 2 秒精度。
+	want := time.Date(2021, 3, 4, 5, 6, 8, 0, time.UTC)
+
+	relPaths := []string{"note.md", filepath.Join("attachments", "a.bin")}
+	for _, rel := range relPaths {
+		p := filepath.Join(srcDir, rel)
+		if err := os.WriteFile(p, []byte("payload"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, want, want); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	zipPath := filepath.Join(dir, "backup.zip")
+	if err := ZipWithPassword(srcDir, zipPath, ""); err != nil {
+		t.Fatalf("ZipWithPassword() error = %v", err)
+	}
+
+	outDir := filepath.Join(dir, "out")
+	if err := UnzipWithPassword(zipPath, outDir, ""); err != nil {
+		t.Fatalf("UnzipWithPassword() error = %v", err)
+	}
+
+	for _, rel := range relPaths {
+		info, err := os.Stat(filepath.Join(outDir, rel))
+		if err != nil {
+			t.Fatalf("stat %s: %v", rel, err)
+		}
+		if diff := info.ModTime().Sub(want); diff > 2*time.Second || diff < -2*time.Second {
+			t.Errorf("%s mtime = %v, want ~%v (diff %v)",
+				rel, info.ModTime().UTC(), want, diff)
+		}
 	}
 }
 
